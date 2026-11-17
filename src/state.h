@@ -5,64 +5,66 @@
 #include <stddef.h>
 #include <time.h>
 
-#define STATE_MAX_BUFFERS  64
-#define STATE_MAX_HISTORY  1024
-#define STATE_MAX_USERS    512
-#define STATE_NAME_LEN     64
-#define STATE_NICK_LEN     32
-#define STATE_TEXT_LEN     1024
+#define STATE_MAX_BUFFERS 64
+#define STATE_MAX_USERS   512
+#define STATE_NAME_LEN    64
+#define STATE_NICK_LEN    32
+#define STATE_TEXT_LEN    1024
 
 typedef enum {
-    BUF_SERVER,
-    BUF_CHANNEL,
-    BUF_QUERY
+	BUF_SERVER,
+	BUF_CHANNEL,
+	BUF_QUERY
 } BufferType;
 
 typedef enum {
-    LINE_MSG,
-    LINE_ACTION,
-    LINE_EVENT,
-    LINE_ERROR
+	LINE_MSG,
+	LINE_ACTION,
+	LINE_EVENT,
+	LINE_ERROR
 } LineKind;
 
 typedef struct {
-    time_t timestamp;
-    LineKind kind;
-    char sender[STATE_NICK_LEN];
-    char text[STATE_TEXT_LEN];
-    bool highlight;
+	time_t timestamp;
+	LineKind kind;
+	char sender[STATE_NICK_LEN];
+	char text[STATE_TEXT_LEN];
+	bool highlight;
 } ChatLine;
 
 typedef struct {
-    char nick[STATE_NICK_LEN];
-    char prefix;
+	char nick[STATE_NICK_LEN];
+	char prefix;
 } ChannelUser;
 
 typedef struct {
-    BufferType type;
-    char name[STATE_NAME_LEN];
-    char topic[STATE_TEXT_LEN];
+	BufferType type;
+	char name[STATE_NAME_LEN];
+	char topic[STATE_TEXT_LEN];
 
-    ChatLine lines[STATE_MAX_HISTORY];
-    size_t line_head;
-    size_t line_count;
+	ChatLine *lines;
+	size_t line_cap;
+	size_t line_head;
+	size_t line_count;
 
-    ChannelUser users[STATE_MAX_USERS];
-    size_t user_count;
+	ChannelUser users[STATE_MAX_USERS];
+	size_t user_count;
 
-    bool unread;
-    bool mention;
+	bool unread;
+	bool mention;
 } Buffer;
 
 typedef struct {
-    char nick[STATE_NICK_LEN];
-    char server_name[STATE_NAME_LEN];
-    Buffer buffers[STATE_MAX_BUFFERS];
-    size_t buffer_count;
-    size_t active_idx;
+	char nick[STATE_NICK_LEN];
+	char server_name[STATE_NAME_LEN];
+	size_t history_cap;
+	Buffer buffers[STATE_MAX_BUFFERS];
+	size_t buffer_count;
+	size_t active_idx;
 } AppState;
 
-void state_init(AppState *st, const char *server_name, const char *nick);
+void state_init(AppState *st, const char *server_name, const char *nick, size_t history_cap);
+void state_free(AppState *st);
 Buffer *state_active_buffer(AppState *st);
 Buffer *state_get_or_create_buffer(AppState *st, const char *name, BufferType type);
 void state_remove_buffer(AppState *st, const char *name);
