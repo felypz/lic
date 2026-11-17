@@ -1,9 +1,12 @@
 #include "lua_api.h"
 
+#include <dirent.h>
 #include <lauxlib.h>
 #include <lualib.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <unistd.h>
 
 static struct LuaEngine *get_engine(lua_State *L) {
 	lua_getfield(L, LUA_REGISTRYINDEX, "lic_engine");
@@ -66,6 +69,16 @@ static int l_nick(lua_State *L) {
 	return 1;
 }
 
+static int l_buffers(lua_State *L) {
+	struct LuaEngine *eng = get_engine(L);
+	lua_newtable(L);
+	for (size_t i = 0; i < eng->state->buffer_count; i++) {
+		lua_pushstring(L, eng->state->buffers[i].name);
+		lua_rawseti(L, -2, (int)i + 1);
+	}
+	return 1;
+}
+
 static int l_on(lua_State *L) {
 	const char *event = luaL_checkstring(L, 1);
 	luaL_checktype(L, 2, LUA_TFUNCTION);
@@ -97,6 +110,85 @@ static int l_command(lua_State *L) {
 	return 0;
 }
 
+static LicColor color_ansi(uint8_t idx) {
+	return (LicColor){.kind = COLOR_ANSI, .idx = idx};
+}
+
+static bool parse_hex_color(const char *s, LicColor *out) {
+	if (!s) {
+		return false;
+	}
+	if (s[0] == '#') {
+		s++;
+	}
+	if (strlen(s) != 6) {
+		return false;
+	}
+	unsigned int rgb = 0;
+	for (int i = 0; i < 6; i++) {
+		char c = s[i];
+		unsigned int nib;
+		if (c >= '0' && c <= '9') {
+			nib = (unsigned int)(c - '0');
+		} else if (c >= 'a' && c <= 'f') {
+			nib = (unsigned int)(c - 'a' + 10);
+		} else if (c >= 'A' && c <= 'F') {
+			nib = (unsigned int)(c - 'A' + 10);
+		} else {
+			return false;
+		}
+		rgb = (rgb << 4) | nib;
+	}
+	out->kind = COLOR_RGB;
+	out->r = (uint8_t)((rgb >> 16) & 0xFF);
+	out->g = (uint8_t)((rgb >> 8) & 0xFF);
+	out->b = (uint8_t)(rgb & 0xFF);
+	return true;
+}
+
+static void read_color_field(lua_State *L, const char *key, LicColor *dst) {
+	lua_getfield(L, -1, key);
+	if (lua_isstring(L, -1)) {
+		const char *str = lua_tostring(L, -1);
+		if (strcasecmp(str, "default") == 0) {
+			dst->kind = COLOR_DEFAULT;
+		} else {
+			parse_hex_color(str, dst);
+		}
+	} else if (lua_isnumber(L, -1)) {
+		lua_Integer val = lua_tointeger(L, -1);
+		if (val < 0) {
+			dst->kind = COLOR_DEFAULT;
+		} else if (val <= 255) {
+			dst->kind = COLOR_ANSI;
+			dst->idx = (uint8_t)val;
+		}
+	}
+	lua_pop(L, 1);
+}
+
+static void parse_theme_table(lua_State *L, LicTheme *th) {
+	lua_getfield(L, -1, "theme");
+	if (!lua_istable(L, -1)) {
+		lua_pop(L, 1);
+		return;
+	}
+
+	read_color_field(L, "bar_bg", &th->bar_bg);
+	read_color_field(L, "bar_fg", &th->bar_fg);
+	read_color_field(L, "active_bg", &th->active_bg);
+	read_color_field(L, "active_fg", &th->active_fg);
+	read_color_field(L, "unread", &th->unread);
+	read_color_field(L, "mention", &th->mention);
+	read_color_field(L, "timestamp", &th->timestamp);
+	read_color_field(L, "event", &th->event);
+	read_color_field(L, "error", &th->error);
+	read_color_field(L, "action", &th->action);
+	read_color_field(L, "prompt", &th->prompt);
+
+	lua_pop(L, 1);
+}
+
 static void parse_config_table(struct LuaEngine *eng) {
 	lua_State *L = eng->L;
 	lua_getglobal(L, "lic");
@@ -104,6 +196,8 @@ static void parse_config_table(struct LuaEngine *eng) {
 		lua_pop(L, 1);
 		return;
 	}
+
+	parse_theme_table(L, &eng->config.theme);
 
 	lua_getfield(L, -1, "config");
 	if (!lua_istable(L, -1)) {
@@ -205,6 +299,7 @@ static void register_api(struct LuaEngine *eng) {
 		{"print",         l_print},
 		{"active_buffer", l_active_buffer},
 		{"nick",          l_nick},
+		{"buffers",       l_buffers},
 		{"on",            l_on},
 		{"command",       l_command},
 		{NULL,            NULL}
@@ -213,23 +308,69 @@ static void register_api(struct LuaEngine *eng) {
 	luaL_newlib(L, funcs);
 	lua_newtable(L);
 	lua_setfield(L, -2, "config");
+	lua_newtable(L);
+	lua_setfield(L, -2, "theme");
 	lua_setglobal(L, "lic");
 }
 
-bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path) {
+static void set_default_config(LicConfig *cfg) {
+	memset(cfg, 0, sizeof(*cfg));
+	snprintf(cfg->host, sizeof(cfg->host), "irc.libera.chat");
+	snprintf(cfg->port, sizeof(cfg->port), "6697");
+	cfg->tls = true;
+	cfg->nick[0] = '\0';
+	snprintf(cfg->user, sizeof(cfg->user), "lic");
+	snprintf(cfg->realname, sizeof(cfg->realname), "Lunar IRC Client");
+	cfg->history_size = 1024;
+
+	cfg->theme = (LicTheme){
+		.bar_bg    = color_ansi(0),
+		.bar_fg    = color_ansi(7),
+		.active_bg = color_ansi(4),
+		.active_fg = color_ansi(0),
+		.unread    = color_ansi(3),
+		.mention   = color_ansi(1),
+		.timestamp = color_ansi(8),
+		.event     = color_ansi(8),
+		.error     = color_ansi(1),
+		.action    = color_ansi(5),
+		.prompt    = color_ansi(6)
+	};
+}
+
+static void load_plugins(struct LuaEngine *eng) {
+	DIR *dir = opendir(eng->plugin_dir);
+	if (!dir) {
+		return;
+	}
+
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+		const char *name = ent->d_name;
+		size_t len = strlen(name);
+		if (len > 4 && strcmp(name + len - 4, ".lua") == 0) {
+			char path[512];
+			snprintf(path, sizeof(path), "%s/%s", eng->plugin_dir, name);
+			if (luaL_dofile(eng->L, path) != LUA_OK) {
+				Buffer *b = state_active_buffer(eng->state);
+				if (b) {
+					buffer_push_line(b, LINE_ERROR, "", lua_tostring(eng->L, -1), false);
+				}
+				lua_pop(eng->L, 1);
+			}
+		}
+	}
+	closedir(dir);
+}
+
+bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path, const char *plugin_dir) {
 	memset(eng, 0, sizeof(*eng));
 	eng->state = st;
 	eng->conn = conn;
 	snprintf(eng->script_path, sizeof(eng->script_path), "%s", script_path);
+	snprintf(eng->plugin_dir, sizeof(eng->plugin_dir), "%s", plugin_dir);
 
-	snprintf(eng->config.host, sizeof(eng->config.host), "irc.libera.chat");
-	snprintf(eng->config.port, sizeof(eng->config.port), "6697");
-	eng->config.tls = true;
-	snprintf(eng->config.nick, sizeof(eng->config.nick), "lic_test");
-	snprintf(eng->config.user, sizeof(eng->config.user), "lic");
-	snprintf(eng->config.realname, sizeof(eng->config.realname), "Lunar IRC Client");
-	eng->config.history_size = 1024;
-
+	set_default_config(&eng->config);
 	return lua_reload(eng);
 }
 
@@ -252,16 +393,19 @@ bool lua_reload(struct LuaEngine *eng) {
 	luaL_openlibs(eng->L);
 	register_api(eng);
 
-	if (luaL_dofile(eng->L, eng->script_path) != LUA_OK) {
-		Buffer *b = state_active_buffer(eng->state);
-		if (b) {
-			buffer_push_line(b, LINE_ERROR, "", lua_tostring(eng->L, -1), false);
+	if (access(eng->script_path, F_OK) == 0) {
+		if (luaL_dofile(eng->L, eng->script_path) != LUA_OK) {
+			Buffer *b = state_active_buffer(eng->state);
+			if (b) {
+				buffer_push_line(b, LINE_ERROR, "", lua_tostring(eng->L, -1), false);
+			}
+			lua_pop(eng->L, 1);
+			return false;
 		}
-		lua_pop(eng->L, 1);
-		return false;
+		parse_config_table(eng);
 	}
 
-	parse_config_table(eng);
+	load_plugins(eng);
 	return true;
 }
 

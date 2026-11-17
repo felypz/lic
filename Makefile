@@ -24,7 +24,7 @@ OBJS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
 all: dirs $(TARGET)
 
 dirs:
-	@mkdir -p $(BUILD_DIR) $(CONF_DIR)
+	@mkdir -p $(BUILD_DIR) $(CONF_DIR) $(CONF_DIR)/plugins
 	@if [ ! -f $(CONF_DIR)/init.lua ] && [ -f $(SRC_DIR)/init.lua ]; then \
 		cp $(SRC_DIR)/init.lua $(CONF_DIR)/init.lua; \
 	fi

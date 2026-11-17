@@ -2,11 +2,25 @@ lic.config = {
 	host = "irc.libera.chat",
 	port = 6697,
 	tls = true,
-	nick = "lic_test",
+	nick = "",
 	user = "lic",
 	realname = "Lunar IRC Client",
 	history_size = 1024,
 	channels = { "#lic-test" },
+}
+
+lic.theme = {
+	bar_bg    = 0,
+	bar_fg    = 7,
+	active_bg = 4,
+	active_fg = 0,
+	unread    = 2,
+	mention   = 3,
+	timestamp = 7,
+	event     = 7,
+	error     = 1,
+	action    = 5,
+	prompt    = 6,
 }
 
 lic.command("shrug", function(arg)

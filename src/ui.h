@@ -27,6 +27,7 @@ typedef struct {
 	size_t cursor;
 	size_t scroll_offset;
 	size_t target_buf_idx;
+	char prompt_label[64];
 	bool dirty;
 
 	bool comp_active;
@@ -40,7 +41,7 @@ typedef struct {
 bool ui_init(UiState *ui);
 void ui_shutdown(void);
 void ui_update_size(UiState *ui);
-void ui_render(UiState *ui, const AppState *st);
+void ui_render(UiState *ui, const AppState *st, const LicTheme *theme);
 UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua, char *out_line, size_t max_len);
 
 #endif

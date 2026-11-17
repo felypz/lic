@@ -6,6 +6,35 @@
 #include "state.h"
 #include <lua.h>
 #include <stdbool.h>
+#include <stdint.h>
+
+typedef enum {
+	COLOR_DEFAULT,
+	COLOR_ANSI,
+	COLOR_RGB
+} ColorKind;
+
+typedef struct {
+	ColorKind kind;
+	uint8_t idx;
+	uint8_t r;
+	uint8_t g;
+	uint8_t b;
+} LicColor;
+
+typedef struct {
+	LicColor bar_bg;
+	LicColor bar_fg;
+	LicColor active_bg;
+	LicColor active_fg;
+	LicColor unread;
+	LicColor mention;
+	LicColor timestamp;
+	LicColor event;
+	LicColor error;
+	LicColor action;
+	LicColor prompt;
+} LicTheme;
 
 typedef struct {
 	char host[128];
@@ -19,6 +48,7 @@ typedef struct {
 	size_t history_size;
 	char auto_join[16][STATE_NAME_LEN];
 	size_t auto_join_count;
+	LicTheme theme;
 } LicConfig;
 
 struct LuaEngine {
@@ -27,9 +57,10 @@ struct LuaEngine {
 	NetConn *conn;
 	LicConfig config;
 	char script_path[256];
+	char plugin_dir[256];
 };
 
-bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path);
+bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path, const char *plugin_dir);
 void lua_engine_close(struct LuaEngine *eng);
 bool lua_reload(struct LuaEngine *eng);
 void lua_exec_string(struct LuaEngine *eng, const char *code);

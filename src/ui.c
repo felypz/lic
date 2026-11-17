@@ -15,7 +15,8 @@ static bool termios_saved = false;
 static volatile sig_atomic_t resized_flag = 0;
 
 static const char *builtin_commands[] = {
-	"join", "part", "msg", "query", "me", "nick", "raw", "quote", "reload", "lua", "quit"
+	"join", "part", "msg", "query", "me", "nick", "whois", "topic",
+	"kick", "mode", "notice", "names", "clear", "close", "raw", "reload", "lua", "quit"
 };
 
 static void handle_sigwinch(int sig) {
@@ -83,6 +84,28 @@ static unsigned int nick_color(const char *nick) {
 	}
 	static const unsigned int palette[] = {31, 32, 33, 34, 35, 36, 91, 92, 93, 94, 95, 96};
 	return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
+}
+
+static const char *fg_seq(LicColor c, char *buf, size_t size) {
+	if (c.kind == COLOR_RGB) {
+		snprintf(buf, size, "\x1b[38;2;%u;%u;%um", c.r, c.g, c.b);
+	} else if (c.kind == COLOR_ANSI) {
+		snprintf(buf, size, "\x1b[38;5;%um", c.idx);
+	} else {
+		snprintf(buf, size, "\x1b[39m");
+	}
+	return buf;
+}
+
+static const char *bg_seq(LicColor c, char *buf, size_t size) {
+	if (c.kind == COLOR_RGB) {
+		snprintf(buf, size, "\x1b[48;2;%u;%u;%um", c.r, c.g, c.b);
+	} else if (c.kind == COLOR_ANSI) {
+		snprintf(buf, size, "\x1b[48;5;%um", c.idx);
+	} else {
+		snprintf(buf, size, "\x1b[49m");
+	}
+	return buf;
 }
 
 static void comp_add(UiState *ui, const char *item) {
@@ -208,7 +231,20 @@ static void delete_prev_word(UiState *ui) {
 	ui->cursor = pos;
 }
 
-void ui_render(UiState *ui, const AppState *st) {
+static size_t next_wrap_chunk(const char *text, size_t width) {
+	size_t len = strlen(text);
+	if (len <= width) {
+		return len;
+	}
+	for (size_t i = width; i > 0; i--) {
+		if (text[i] == ' ') {
+			return i;
+		}
+	}
+	return width;
+}
+
+void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	if (resized_flag) {
 		resized_flag = 0;
 		ui_update_size(ui);
@@ -219,7 +255,22 @@ void ui_render(UiState *ui, const AppState *st) {
 		return;
 	}
 
-	char frame[65536];
+	char c_bar_bg[32], c_bar_fg[32], c_act_bg[32], c_act_fg[32];
+	char c_unread[32], c_mention[32], c_ts[32], c_event[32], c_err[32], c_act[32], c_prompt[32];
+
+	bg_seq(theme->bar_bg, c_bar_bg, sizeof(c_bar_bg));
+	fg_seq(theme->bar_fg, c_bar_fg, sizeof(c_bar_fg));
+	bg_seq(theme->active_bg, c_act_bg, sizeof(c_act_bg));
+	fg_seq(theme->active_fg, c_act_fg, sizeof(c_act_fg));
+	fg_seq(theme->unread, c_unread, sizeof(c_unread));
+	fg_seq(theme->mention, c_mention, sizeof(c_mention));
+	fg_seq(theme->timestamp, c_ts, sizeof(c_ts));
+	fg_seq(theme->event, c_event, sizeof(c_event));
+	fg_seq(theme->error, c_err, sizeof(c_err));
+	fg_seq(theme->action, c_act, sizeof(c_act));
+	fg_seq(theme->prompt, c_prompt, sizeof(c_prompt));
+
+	char frame[131072];
 	size_t pos = 0;
 
 	#define EMIT(...) do { \
@@ -231,7 +282,7 @@ void ui_render(UiState *ui, const AppState *st) {
 
 	EMIT("\x1b[?25l\x1b[H");
 
-	EMIT("\x1b[48;5;235m\x1b[38;5;252m");
+	EMIT("%s%s", c_bar_bg, c_bar_fg);
 	int top_used = 0;
 	for (size_t i = 0; i < st->buffer_count; i++) {
 		const Buffer *b = &st->buffers[i];
@@ -243,11 +294,11 @@ void ui_render(UiState *ui, const AppState *st) {
 		}
 
 		if (i == st->active_idx) {
-			EMIT("\x1b[1;38;5;232m\x1b[48;5;111m%s\x1b[0m\x1b[48;5;235m\x1b[38;5;252m", tag);
+			EMIT("\x1b[1m%s%s%s\x1b[0m%s%s", c_act_fg, c_act_bg, tag, c_bar_bg, c_bar_fg);
 		} else if (b->mention) {
-			EMIT("\x1b[1;31m%s\x1b[0m\x1b[48;5;235m\x1b[38;5;252m", tag);
+			EMIT("\x1b[1m%s%s\x1b[0m%s%s", c_mention, tag, c_bar_bg, c_bar_fg);
 		} else if (b->unread) {
-			EMIT("\x1b[1;33m%s\x1b[0m\x1b[48;5;235m\x1b[38;5;252m", tag);
+			EMIT("\x1b[1m%s%s\x1b[0m%s%s", c_unread, tag, c_bar_bg, c_bar_fg);
 		} else {
 			EMIT("%s", tag);
 		}
@@ -265,11 +316,12 @@ void ui_render(UiState *ui, const AppState *st) {
 
 	size_t total = buf->line_count;
 	size_t end_idx = total > ui->scroll_offset ? total - ui->scroll_offset : 0;
-	size_t start_idx = end_idx > (size_t)chat_rows ? end_idx - (size_t)chat_rows : 0;
 
-	int drawn_rows = 0;
-	for (size_t i = start_idx; i < end_idx && drawn_rows < chat_rows; i++) {
-		const ChatLine *cl = buffer_get_line(buf, i);
+	char visual_rows[256][1024];
+	int vcount = 0;
+
+	for (size_t i = end_idx; i > 0 && vcount < chat_rows; i--) {
+		const ChatLine *cl = buffer_get_line(buf, i - 1);
 		if (!cl) {
 			continue;
 		}
@@ -278,35 +330,82 @@ void ui_render(UiState *ui, const AppState *st) {
 		char ts[16];
 		strftime(ts, sizeof(ts), "%H:%M", tm_info);
 
-		EMIT("\x1b[2K\x1b[38;5;242m%s\x1b[0m ", ts);
-
-		if (cl->kind == LINE_MSG) {
-			unsigned int col = nick_color(cl->sender);
-			if (cl->highlight) {
-				EMIT("\x1b[1;31m<%s>\x1b[0m \x1b[1m%.*s\x1b[0m\r\n",
-				     cl->sender, ui->cols - 12, cl->text);
-			} else {
-				EMIT("\x1b[%um<%s>\x1b[0m %.*s\r\n",
-				     col, cl->sender, ui->cols - 12, cl->text);
-			}
-		} else if (cl->kind == LINE_ACTION) {
-			EMIT("\x1b[35m* %s %.*s\x1b[0m\r\n",
-			     cl->sender, ui->cols - 12, cl->text);
+		int prefix_len = 6;
+		if (cl->kind == LINE_MSG || cl->kind == LINE_ACTION) {
+			prefix_len += (int)strlen(cl->sender) + 3;
 		} else if (cl->kind == LINE_ERROR) {
-			EMIT("\x1b[31m! %.*s\x1b[0m\r\n", ui->cols - 10, cl->text);
+			prefix_len += 2;
 		} else {
-			EMIT("\x1b[38;5;245m-- %.*s\x1b[0m\r\n", ui->cols - 11, cl->text);
+			prefix_len += 3;
 		}
-		drawn_rows++;
+
+		int text_width = ui->cols - prefix_len;
+		if (text_width < 10) {
+			text_width = 10;
+		}
+
+		const char *p = cl->text;
+		char line_chunks[32][1024];
+		int chunk_count = 0;
+
+		if (*p == '\0') {
+			line_chunks[chunk_count++][0] = '\0';
+		} else {
+			while (*p && chunk_count < 32) {
+				size_t take = next_wrap_chunk(p, (size_t)text_width);
+				snprintf(line_chunks[chunk_count++], sizeof(line_chunks[0]), "%.*s", (int)take, p);
+				p += take;
+				while (*p == ' ') {
+					p++;
+				}
+			}
+		}
+
+		for (int c = chunk_count - 1; c >= 0 && vcount < chat_rows; c--) {
+			if (c == 0) {
+				if (cl->kind == LINE_MSG) {
+					unsigned int col = nick_color(cl->sender);
+					if (cl->highlight) {
+						snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
+						         "%s%s\x1b[0m \x1b[1m%s<%s>\x1b[0m \x1b[1m%s\x1b[0m",
+						         c_ts, ts, c_mention, cl->sender, line_chunks[c]);
+					} else {
+						snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
+						         "%s%s\x1b[0m \x1b[%um<%s>\x1b[0m %s",
+						         c_ts, ts, col, cl->sender, line_chunks[c]);
+					}
+				} else if (cl->kind == LINE_ACTION) {
+					snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
+					         "%s%s\x1b[0m %s* %s %s\x1b[0m",
+					         c_ts, ts, c_act, cl->sender, line_chunks[c]);
+				} else if (cl->kind == LINE_ERROR) {
+					snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
+					         "%s%s\x1b[0m %s! %s\x1b[0m",
+					         c_ts, ts, c_err, line_chunks[c]);
+				} else {
+					snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
+					         "%s%s\x1b[0m %s-- %s\x1b[0m",
+					         c_ts, ts, c_event, line_chunks[c]);
+				}
+			} else {
+				snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
+				         "%*s%s", prefix_len, "", line_chunks[c]);
+			}
+			vcount++;
+		}
 	}
 
-	while (drawn_rows < chat_rows) {
+	int drawn = 0;
+	for (int i = vcount - 1; i >= 0; i--) {
+		EMIT("\x1b[2K%s\r\n", visual_rows[i]);
+		drawn++;
+	}
+	while (drawn < chat_rows) {
 		EMIT("\x1b[2K\r\n");
-		drawn_rows++;
+		drawn++;
 	}
 
-	/* Status bar or Wildmenu */
-	EMIT("\x1b[48;5;235m\x1b[38;5;250m");
+	EMIT("%s%s", c_bar_bg, c_bar_fg);
 	if (ui->comp_active && ui->comp_count > 1) {
 		int wused = 0;
 		for (size_t i = 0; i < ui->comp_count; i++) {
@@ -316,7 +415,7 @@ void ui_render(UiState *ui, const AppState *st) {
 				break;
 			}
 			if (i == ui->comp_idx) {
-				EMIT("\x1b[1;38;5;232m\x1b[48;5;111m%s\x1b[0m\x1b[48;5;235m\x1b[38;5;250m", item);
+				EMIT("\x1b[1m%s%s%s\x1b[0m%s%s", c_act_fg, c_act_bg, item, c_bar_bg, c_bar_fg);
 			} else {
 				EMIT("%s", item);
 			}
@@ -324,13 +423,16 @@ void ui_render(UiState *ui, const AppState *st) {
 		}
 		EMIT("\x1b[K\x1b[0m\r\n");
 	} else {
-		EMIT(" [%s] %s (%zu users)%s\x1b[K\x1b[0m\r\n",
+		EMIT(" [%s] %s (%zu users)%s%s%s\x1b[K\x1b[0m\r\n",
 		     st->nick, buf->name, buf->user_count,
+		     buf->topic[0] ? " | " : "",
+		     buf->topic[0] ? buf->topic : "",
 		     ui->scroll_offset > 0 ? " [SCROLL]" : "");
 	}
 
-	char prompt[STATE_NICK_LEN + 8];
-	int plen = snprintf(prompt, sizeof(prompt), "[%s] ", st->nick);
+	char prompt[STATE_NICK_LEN + 16];
+	const char *plabel = ui->prompt_label[0] ? ui->prompt_label : st->nick;
+	int plen = snprintf(prompt, sizeof(prompt), "[%s] ", plabel);
 	int avail = ui->cols - plen - 1;
 	if (avail < 1) {
 		avail = 1;
@@ -341,7 +443,7 @@ void ui_render(UiState *ui, const AppState *st) {
 		view_start = ui->cursor - (size_t)avail + 1;
 	}
 
-	EMIT("\x1b[2K\x1b[1;36m%s\x1b[0m%.*s", prompt, avail, ui->input + view_start);
+	EMIT("\x1b[2K\x1b[1m%s%s\x1b[0m%.*s", c_prompt, prompt, avail, ui->input + view_start);
 
 	int cursor_col = plen + (int)(ui->cursor - view_start) + 1;
 	EMIT("\x1b[%d;%dH\x1b[?25h", ui->rows, cursor_col);
@@ -361,7 +463,6 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 
 	ui->dirty = true;
 
-	/* Escape sequences (Arrows, PgUp/PgDn, Shift+Tab, Alt+keys) */
 	if (seq[0] == '\x1b' && n >= 2) {
 		if (seq[1] == '[' && n >= 3) {
 			ui->comp_active = false;
@@ -389,7 +490,6 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			return UI_ACTION_NONE;
 		}
 
-		/* Alt + key bindings */
 		ui->comp_active = false;
 		char alt = seq[1];
 		if (alt == 'j') {

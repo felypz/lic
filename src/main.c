@@ -42,6 +42,33 @@ static bool contains_nick(const char *text, const char *nick) {
 	return false;
 }
 
+static bool prompt_for_nick(UiState *ui, AppState *st, const LicTheme *theme, char *out_nick, size_t max_len) {
+	Buffer *srv = state_active_buffer(st);
+	buffer_push_line(srv, LINE_EVENT, "", "No nickname configured. Enter your nickname below:", false);
+	snprintf(ui->prompt_label, sizeof(ui->prompt_label), "nickname");
+	ui_render(ui, st, theme);
+
+	struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+	char line[UI_INPUT_MAX];
+
+	while (true) {
+		if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+			UiAction act = ui_handle_stdin(ui, st, NULL, line, sizeof(line));
+			if (act == UI_ACTION_QUIT) {
+				return false;
+			}
+			if (act == UI_ACTION_SUBMIT && line[0] != '\0') {
+				snprintf(out_nick, max_len, "%.*s", (int)(max_len - 1), line);
+				ui->prompt_label[0] = '\0';
+				return true;
+			}
+		}
+		if (ui->dirty) {
+			ui_render(ui, st, theme);
+		}
+	}
+}
+
 static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *lua, IrcMessage *msg) {
 	if (strcmp(msg->command, "PING") == 0 && msg->param_count > 0) {
 		irc_send_raw(conn, "PONG :%s", msg->params[0]);
@@ -108,6 +135,14 @@ static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *
 			irc_send_join(conn, lua->config.auto_join[i]);
 			state_get_or_create_buffer(st, lua->config.auto_join[i], BUF_CHANNEL);
 		}
+	} else if (strcmp(msg->command, "433") == 0) {
+		size_t len = strlen(st->nick);
+		if (len + 1 < sizeof(st->nick)) {
+			st->nick[len] = '_';
+			st->nick[len + 1] = '\0';
+			irc_send_raw(conn, "NICK %s", st->nick);
+			buffer_push_line(srv, LINE_EVENT, "", "Nickname in use, retrying with underscore", false);
+		}
 	} else if (strcmp(msg->command, "PRIVMSG") == 0 && msg->param_count >= 2) {
 		const char *target = msg->params[0];
 		const char *text = msg->params[1];
@@ -138,6 +173,10 @@ static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *
 				b->mention = true;
 			}
 		}
+	} else if (strcmp(msg->command, "NOTICE") == 0 && msg->param_count >= 2) {
+		char ev[STATE_TEXT_LEN];
+		snprintf(ev, sizeof(ev), "-%s- %s", msg->nick ? msg->nick : "server", msg->params[1]);
+		buffer_push_line(state_active_buffer(st), LINE_EVENT, "", ev, false);
 	} else if (strcmp(msg->command, "JOIN") == 0 && msg->param_count >= 1) {
 		const char *chan = msg->params[0];
 		const char *who = msg->nick ? msg->nick : "?";
@@ -159,6 +198,23 @@ static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *
 			snprintf(ev, sizeof(ev), "%s left %s", who, chan);
 			buffer_push_line(b, LINE_EVENT, "", ev, false);
 		}
+	} else if (strcmp(msg->command, "KICK") == 0 && msg->param_count >= 2) {
+		const char *chan = msg->params[0];
+		const char *kicked = msg->params[1];
+		const char *by = msg->nick ? msg->nick : "?";
+		const char *reason = msg->param_count >= 3 ? msg->params[2] : "";
+		if (strcasecmp(kicked, st->nick) == 0) {
+			state_remove_buffer(st, chan);
+			char ev[STATE_TEXT_LEN];
+			snprintf(ev, sizeof(ev), "Kicked from %s by %s (%s)", chan, by, reason);
+			buffer_push_line(srv, LINE_ERROR, "", ev, true);
+		} else {
+			Buffer *b = state_get_or_create_buffer(st, chan, BUF_CHANNEL);
+			buffer_remove_user(b, kicked);
+			char ev[STATE_TEXT_LEN];
+			snprintf(ev, sizeof(ev), "%s was kicked by %s (%s)", kicked, by, reason);
+			buffer_push_line(b, LINE_EVENT, "", ev, false);
+		}
 	} else if (strcmp(msg->command, "QUIT") == 0) {
 		const char *who = msg->nick ? msg->nick : "?";
 		state_remove_user_everywhere(st, who);
@@ -175,6 +231,12 @@ static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *
 		char ev[STATE_TEXT_LEN];
 		snprintf(ev, sizeof(ev), "%s is now known as %s", old_n, new_n);
 		buffer_push_line(srv, LINE_EVENT, "", ev, false);
+	} else if (strcmp(msg->command, "TOPIC") == 0 && msg->param_count >= 2) {
+		Buffer *b = state_get_or_create_buffer(st, msg->params[0], BUF_CHANNEL);
+		snprintf(b->topic, sizeof(b->topic), "%s", msg->params[1]);
+		char ev[STATE_TEXT_LEN];
+		snprintf(ev, sizeof(ev), "Topic changed to: %s", msg->params[1]);
+		buffer_push_line(b, LINE_EVENT, "", ev, false);
 	} else if (strcmp(msg->command, "353") == 0 && msg->param_count >= 4) {
 		Buffer *b = state_get_or_create_buffer(st, msg->params[2], BUF_CHANNEL);
 		char names[STATE_TEXT_LEN];
@@ -210,8 +272,8 @@ int main(void) {
 	struct LuaEngine lua;
 	UiState ui;
 
-	state_init(state, "irc.libera.chat", "lic_test", 1024);
-	lua_engine_init(&lua, state, &conn, "config/init.lua");
+	state_init(state, "irc.libera.chat", "", 1024);
+	lua_engine_init(&lua, state, &conn, "config/init.lua", "config/plugins");
 	state_init(state, lua.config.host, lua.config.nick, lua.config.history_size);
 
 	if (!ui_init(&ui)) {
@@ -221,13 +283,23 @@ int main(void) {
 		return 1;
 	}
 
+	if (lua.config.nick[0] == '\0') {
+		if (!prompt_for_nick(&ui, state, &lua.config.theme, lua.config.nick, sizeof(lua.config.nick))) {
+			lua_engine_close(&lua);
+			state_free(state);
+			free(state);
+			return 0;
+		}
+		snprintf(state->nick, sizeof(state->nick), "%s", lua.config.nick);
+	}
+
 	Buffer *srv = state_active_buffer(state);
 	buffer_push_line(srv, LINE_EVENT, "", "Connecting...", false);
-	ui_render(&ui, state);
+	ui_render(&ui, state, &lua.config.theme);
 
 	if (!net_connect(&conn, lua.config.host, lua.config.port, lua.config.tls)) {
 		buffer_push_line(srv, LINE_ERROR, "", "Connection failed", false);
-		ui_render(&ui, state);
+		ui_render(&ui, state, &lua.config.theme);
 		sleep(2);
 		lua_engine_close(&lua);
 		state_free(state);
@@ -251,7 +323,7 @@ int main(void) {
 	while (running && conn.connected) {
 		if (poll(pfds, 2, 100) < 0) {
 			if (ui.dirty) {
-				ui_render(&ui, state);
+				ui_render(&ui, state, &lua.config.theme);
 			}
 			continue;
 		}
@@ -294,7 +366,7 @@ int main(void) {
 		}
 
 		if (ui.dirty) {
-			ui_render(&ui, state);
+			ui_render(&ui, state, &lua.config.theme);
 		}
 	}
 
