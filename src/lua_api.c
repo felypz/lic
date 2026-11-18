@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -338,6 +339,45 @@ static void set_default_config(LicConfig *cfg) {
 	};
 }
 
+static void resolve_config_paths(struct LuaEngine *eng, const char *script_path, const char *plugin_dir) {
+	if (access(script_path, F_OK) == 0) {
+		snprintf(eng->script_path, sizeof(eng->script_path), "%s", script_path);
+		snprintf(eng->plugin_dir, sizeof(eng->plugin_dir), "%s", plugin_dir);
+		return;
+	}
+
+	const char *xdg = getenv("XDG_CONFIG_HOME");
+	const char *home = getenv("HOME");
+	if (!home) {
+		struct passwd *pw = getpwuid(getuid());
+		if (pw) {
+			home = pw->pw_dir;
+		}
+	}
+
+	char xdg_init[sizeof(eng->script_path)];
+	char xdg_plugins[sizeof(eng->plugin_dir)];
+
+	if (xdg && xdg[0] != '\0') {
+		snprintf(xdg_init, sizeof(xdg_init), "%s/lic/init.lua", xdg);
+		snprintf(xdg_plugins, sizeof(xdg_plugins), "%s/lic/plugins", xdg);
+	} else if (home && home[0] != '\0') {
+		snprintf(xdg_init, sizeof(xdg_init), "%s/.config/lic/init.lua", home);
+		snprintf(xdg_plugins, sizeof(xdg_plugins), "%s/.config/lic/plugins", home);
+	} else {
+		xdg_init[0] = '\0';
+	}
+
+	if (xdg_init[0] != '\0' && access(xdg_init, F_OK) == 0) {
+		snprintf(eng->script_path, sizeof(eng->script_path), "%s", xdg_init);
+		snprintf(eng->plugin_dir, sizeof(eng->plugin_dir), "%s", xdg_plugins);
+		return;
+	}
+
+	snprintf(eng->script_path, sizeof(eng->script_path), "%s", script_path);
+	snprintf(eng->plugin_dir, sizeof(eng->plugin_dir), "%s", plugin_dir);
+}
+
 static void load_plugins(struct LuaEngine *eng) {
 	DIR *dir = opendir(eng->plugin_dir);
 	if (!dir) {
@@ -367,9 +407,8 @@ bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const c
 	memset(eng, 0, sizeof(*eng));
 	eng->state = st;
 	eng->conn = conn;
-	snprintf(eng->script_path, sizeof(eng->script_path), "%s", script_path);
-	snprintf(eng->plugin_dir, sizeof(eng->plugin_dir), "%s", plugin_dir);
 
+	resolve_config_paths(eng, script_path, plugin_dir);
 	set_default_config(&eng->config);
 	return lua_reload(eng);
 }
