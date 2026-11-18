@@ -9,6 +9,7 @@
 #define UI_INPUT_MAX    1024
 #define UI_COMP_MAX     128
 #define UI_COMP_STR_LEN 64
+#define UI_HIST_MAX     64
 
 typedef enum {
 	UI_ACTION_NONE,
@@ -30,9 +31,15 @@ typedef struct {
 	char prompt_label[64];
 	bool dirty;
 
+	char history[UI_HIST_MAX][UI_INPUT_MAX];
+	size_t hist_count;
+	size_t hist_pos;
+	char hist_draft[UI_INPUT_MAX];
+
 	bool comp_active;
 	size_t comp_start;
 	size_t comp_end;
+	char comp_orig[UI_COMP_STR_LEN];
 	char comp_matches[UI_COMP_MAX][UI_COMP_STR_LEN];
 	size_t comp_count;
 	size_t comp_idx;

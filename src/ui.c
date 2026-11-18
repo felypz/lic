@@ -264,6 +264,49 @@ static const char *bg_seq(LicColor c, char *buf, size_t size) {
 	return buf;
 }
 
+static void history_push(UiState *ui, const char *line) {
+	if (!line || line[0] == '\0') {
+		return;
+	}
+	if (ui->hist_count > 0 && strcmp(ui->history[ui->hist_count - 1], line) == 0) {
+		ui->hist_pos = ui->hist_count;
+		return;
+	}
+	if (ui->hist_count == UI_HIST_MAX) {
+		memmove(ui->history[0], ui->history[1], (UI_HIST_MAX - 1) * sizeof(ui->history[0]));
+		ui->hist_count--;
+	}
+	snprintf(ui->history[ui->hist_count++], UI_INPUT_MAX, "%s", line);
+	ui->hist_pos = ui->hist_count;
+}
+
+static void history_prev(UiState *ui) {
+	if (ui->hist_count == 0 || ui->hist_pos == 0) {
+		return;
+	}
+	if (ui->hist_pos == ui->hist_count) {
+		snprintf(ui->hist_draft, sizeof(ui->hist_draft), "%s", ui->input);
+	}
+	ui->hist_pos--;
+	snprintf(ui->input, sizeof(ui->input), "%s", ui->history[ui->hist_pos]);
+	ui->input_len = strlen(ui->input);
+	ui->cursor = ui->input_len;
+}
+
+static void history_next(UiState *ui) {
+	if (ui->hist_pos >= ui->hist_count) {
+		return;
+	}
+	ui->hist_pos++;
+	if (ui->hist_pos == ui->hist_count) {
+		snprintf(ui->input, sizeof(ui->input), "%s", ui->hist_draft);
+	} else {
+		snprintf(ui->input, sizeof(ui->input), "%s", ui->history[ui->hist_pos]);
+	}
+	ui->input_len = strlen(ui->input);
+	ui->cursor = ui->input_len;
+}
+
 static void comp_add(UiState *ui, const char *item) {
 	if (ui->comp_count >= UI_COMP_MAX) {
 		return;
@@ -276,26 +319,32 @@ static void comp_add(UiState *ui, const char *item) {
 	snprintf(ui->comp_matches[ui->comp_count++], UI_COMP_STR_LEN, "%s", item);
 }
 
+static void replace_input_span(UiState *ui, size_t start, size_t end, const char *replacement) {
+	size_t rlen = strlen(replacement);
+	size_t old_len = end - start;
+	if (ui->input_len - old_len + rlen >= UI_INPUT_MAX) {
+		return;
+	}
+	memmove(ui->input + start + rlen, ui->input + end, ui->input_len - end + 1);
+	memcpy(ui->input + start, replacement, rlen);
+	ui->input_len = ui->input_len - old_len + rlen;
+	ui->comp_end = start + rlen;
+	ui->cursor = ui->comp_end;
+}
+
 static void apply_completion(UiState *ui) {
 	if (!ui->comp_active || ui->comp_count == 0) {
 		return;
 	}
-	const char *match = ui->comp_matches[ui->comp_idx];
-	size_t mlen = strlen(match);
-	size_t old_len = ui->comp_end - ui->comp_start;
+	replace_input_span(ui, ui->comp_start, ui->comp_end, ui->comp_matches[ui->comp_idx]);
+}
 
-	if (ui->input_len - old_len + mlen >= UI_INPUT_MAX) {
+static void cancel_completion(UiState *ui) {
+	if (!ui->comp_active) {
 		return;
 	}
-
-	memmove(ui->input + ui->comp_start + mlen,
-	        ui->input + ui->comp_end,
-	        ui->input_len - ui->comp_end + 1);
-	memcpy(ui->input + ui->comp_start, match, mlen);
-
-	ui->input_len = ui->input_len - old_len + mlen;
-	ui->comp_end = ui->comp_start + mlen;
-	ui->cursor = ui->comp_end;
+	replace_input_span(ui, ui->comp_start, ui->comp_end, ui->comp_orig);
+	ui->comp_active = false;
 }
 
 static void trigger_completion(UiState *ui, const AppState *st, struct LuaEngine *lua, bool reverse) {
@@ -315,20 +364,20 @@ static void trigger_completion(UiState *ui, const AppState *st, struct LuaEngine
 	}
 
 	size_t prefix_len = ui->cursor - start;
-	char prefix[UI_COMP_STR_LEN];
-	if (prefix_len >= sizeof(prefix)) {
+	if (prefix_len >= UI_COMP_STR_LEN) {
 		return;
 	}
-	memcpy(prefix, ui->input + start, prefix_len);
-	prefix[prefix_len] = '\0';
+
+	memcpy(ui->comp_orig, ui->input + start, prefix_len);
+	ui->comp_orig[prefix_len] = '\0';
 
 	ui->comp_count = 0;
 	ui->comp_start = start;
 	ui->comp_end = ui->cursor;
 	ui->comp_idx = 0;
 
-	if (start == 0 && prefix[0] == '/') {
-		const char *cmd_prefix = prefix + 1;
+	if (start == 0 && ui->comp_orig[0] == '/') {
+		const char *cmd_prefix = ui->comp_orig + 1;
 		size_t clen = strlen(cmd_prefix);
 
 		for (size_t i = 0; i < sizeof(builtin_commands) / sizeof(builtin_commands[0]); i++) {
@@ -348,11 +397,20 @@ static void trigger_completion(UiState *ui, const AppState *st, struct LuaEngine
 				comp_add(ui, full);
 			}
 		}
+	} else if (ui->comp_orig[0] == '#' || ui->comp_orig[0] == '&') {
+		for (size_t i = 0; i < st->buffer_count; i++) {
+			if (st->buffers[i].type == BUF_CHANNEL &&
+			    strncasecmp(st->buffers[i].name, ui->comp_orig, prefix_len) == 0) {
+				char full[UI_COMP_STR_LEN];
+				snprintf(full, sizeof(full), "%s ", st->buffers[i].name);
+				comp_add(ui, full);
+			}
+		}
 	} else {
 		const Buffer *buf = state_active_buffer((AppState *)st);
 		if (buf) {
 			for (size_t i = 0; i < buf->user_count; i++) {
-				if (strncasecmp(buf->users[i].nick, prefix, prefix_len) == 0) {
+				if (strncasecmp(buf->users[i].nick, ui->comp_orig, prefix_len) == 0) {
 					char full[UI_COMP_STR_LEN];
 					if (start == 0) {
 						snprintf(full, sizeof(full), "%s: ", buf->users[i].nick);
@@ -371,20 +429,43 @@ static void trigger_completion(UiState *ui, const AppState *st, struct LuaEngine
 	}
 }
 
+static size_t word_prev_pos(const char *s, size_t pos) {
+	while (pos > 0 && isspace((unsigned char)s[pos - 1])) {
+		pos--;
+	}
+	while (pos > 0 && !isspace((unsigned char)s[pos - 1])) {
+		pos = utf8_prev_cp(s, pos);
+	}
+	return pos;
+}
+
+static size_t word_next_pos(const char *s, size_t len, size_t pos) {
+	while (pos < len && !isspace((unsigned char)s[pos])) {
+		pos = utf8_next_cp(s, len, pos);
+	}
+	while (pos < len && isspace((unsigned char)s[pos])) {
+		pos++;
+	}
+	return pos;
+}
+
 static void delete_prev_word(UiState *ui) {
 	if (ui->cursor == 0) {
 		return;
 	}
-	size_t pos = ui->cursor;
-	while (pos > 0 && isspace((unsigned char)ui->input[pos - 1])) {
-		pos--;
-	}
-	while (pos > 0 && !isspace((unsigned char)ui->input[pos - 1])) {
-		pos = utf8_prev_cp(ui->input, pos);
-	}
+	size_t pos = word_prev_pos(ui->input, ui->cursor);
 	memmove(ui->input + pos, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
 	ui->input_len -= (ui->cursor - pos);
 	ui->cursor = pos;
+}
+
+static void delete_next_word(UiState *ui) {
+	if (ui->cursor >= ui->input_len) {
+		return;
+	}
+	size_t pos = word_next_pos(ui->input, ui->input_len, ui->cursor);
+	memmove(ui->input + ui->cursor, ui->input + pos, ui->input_len - pos + 1);
+	ui->input_len -= (pos - ui->cursor);
 }
 
 static size_t next_wrap_chunk(const char *text, size_t width) {
@@ -583,8 +664,13 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	}
 
 	EMIT("%s%s", c_bar_bg, c_bar_fg);
-	if (ui->comp_active && ui->comp_count > 1) {
+	if (ui->comp_active && ui->comp_count > 0) {
 		int wused = 0;
+		char count_tag[32];
+		int clen = snprintf(count_tag, sizeof(count_tag), " [%zu/%zu] ", ui->comp_idx + 1, ui->comp_count);
+		EMIT("%s", count_tag);
+		wused += clen;
+
 		for (size_t i = 0; i < ui->comp_count; i++) {
 			char item[UI_COMP_STR_LEN + 4];
 			int ilen = snprintf(item, sizeof(item), " %s ", ui->comp_matches[i]);
@@ -650,12 +736,25 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 
 	ui->dirty = true;
 
-	if (seq[0] == '\x1b' && n >= 2) {
+	if (seq[0] == '\x1b') {
+		if (n == 1) {
+			if (ui->comp_active) {
+				cancel_completion(ui);
+			}
+			return UI_ACTION_NONE;
+		}
+
 		if (seq[1] == '[' && n >= 3) {
-			ui->comp_active = false;
 			if (seq[2] == 'Z') {
-				ui->comp_active = true;
 				trigger_completion(ui, st, lua, true);
+				return UI_ACTION_NONE;
+			}
+
+			ui->comp_active = false;
+			if (seq[2] == 'A') {
+				history_prev(ui);
+			} else if (seq[2] == 'B') {
+				history_next(ui);
 			} else if (seq[2] == 'D' && ui->cursor > 0) {
 				ui->cursor = utf8_prev_cp(ui->input, ui->cursor);
 			} else if (seq[2] == 'C' && ui->cursor < ui->input_len) {
@@ -688,6 +787,12 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			ui->cursor = utf8_prev_cp(ui->input, ui->cursor);
 		} else if (alt == 'l' && ui->cursor < ui->input_len) {
 			ui->cursor = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
+		} else if (alt == 'b') {
+			ui->cursor = word_prev_pos(ui->input, ui->cursor);
+		} else if (alt == 'w' || alt == 'e' || alt == 'f') {
+			ui->cursor = word_next_pos(ui->input, ui->input_len, ui->cursor);
+		} else if (alt == 'd') {
+			delete_next_word(ui);
 		} else if (alt == 'n') {
 			ui->scroll_offset = 0;
 			return UI_ACTION_NEXT_BUF;
@@ -710,7 +815,26 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			continue;
 		}
 
-		ui->comp_active = false;
+		/* Vim wildmenu navigation while completion bar is open */
+		if (ui->comp_active) {
+			if (c == 14) { /* Ctrl+N: next match */
+				trigger_completion(ui, st, lua, false);
+				continue;
+			}
+			if (c == 16) { /* Ctrl+P: previous match */
+				trigger_completion(ui, st, lua, true);
+				continue;
+			}
+			if (c == 25) { /* Ctrl+Y: accept match and stay on input */
+				ui->comp_active = false;
+				continue;
+			}
+			if (c == 5) {  /* Ctrl+E: abort wildmenu and restore original prefix */
+				cancel_completion(ui);
+				continue;
+			}
+			ui->comp_active = false;
+		}
 
 		if (c == 3) {
 			return UI_ACTION_QUIT;
@@ -731,19 +855,25 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			ui->cursor = ui->input_len;
 			continue;
 		}
-		if (c == 21) {
+		if (c == 11) { /* Ctrl+K: kill to end of line */
+			ui->input[ui->cursor] = '\0';
+			ui->input_len = ui->cursor;
+			continue;
+		}
+		if (c == 21) { /* Ctrl+U: kill whole line */
 			ui->input_len = 0;
 			ui->cursor = 0;
 			ui->input[0] = '\0';
 			continue;
 		}
-		if (c == 23) {
+		if (c == 23) { /* Ctrl+W: delete prev word */
 			delete_prev_word(ui);
 			continue;
 		}
 
 		if (c == '\r' || c == '\n') {
 			snprintf(out_line, max_len, "%s", ui->input);
+			history_push(ui, ui->input);
 			ui->input_len = 0;
 			ui->cursor = 0;
 			ui->input[0] = '\0';
