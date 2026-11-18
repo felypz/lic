@@ -19,6 +19,10 @@ static const char *builtin_commands[] = {
 	"kick", "mode", "notice", "names", "clear", "close", "raw", "reload", "lua", "quit"
 };
 
+static const unsigned int mirc_ansi_palette[16] = {
+	15, 0, 4, 2, 9, 1, 5, 3, 11, 10, 6, 14, 12, 13, 8, 7
+};
+
 static void handle_sigwinch(int sig) {
 	(void)sig;
 	resized_flag = 1;
@@ -75,6 +79,158 @@ bool ui_init(UiState *ui) {
 
 	ui_update_size(ui);
 	return true;
+}
+
+static bool is_utf8_cont(unsigned char c) {
+	return (c & 0xC0) == 0x80;
+}
+
+static size_t utf8_prev_cp(const char *s, size_t pos) {
+	if (pos == 0) {
+		return 0;
+	}
+	pos--;
+	while (pos > 0 && is_utf8_cont((unsigned char)s[pos])) {
+		pos--;
+	}
+	return pos;
+}
+
+static size_t utf8_next_cp(const char *s, size_t len, size_t pos) {
+	if (pos >= len) {
+		return len;
+	}
+	pos++;
+	while (pos < len && is_utf8_cont((unsigned char)s[pos])) {
+		pos++;
+	}
+	return pos;
+}
+
+static size_t utf8_visual_cols(const char *s, size_t byte_len) {
+	size_t cols = 0;
+	for (size_t i = 0; i < byte_len && s[i]; i++) {
+		if (!is_utf8_cont((unsigned char)s[i])) {
+			cols++;
+		}
+	}
+	return cols;
+}
+
+static size_t parse_irc_color_seq(const char *s, int *fg_out, int *bg_out) {
+	size_t idx = 1;
+	*fg_out = -1;
+	*bg_out = -1;
+
+	if (!isdigit((unsigned char)s[idx])) {
+		return idx;
+	}
+
+	int fg = s[idx++] - '0';
+	if (isdigit((unsigned char)s[idx])) {
+		fg = fg * 10 + (s[idx++] - '0');
+	}
+	*fg_out = fg;
+
+	if (s[idx] == ',' && isdigit((unsigned char)s[idx + 1])) {
+		idx++;
+		int bg = s[idx++] - '0';
+		if (isdigit((unsigned char)s[idx])) {
+			bg = bg * 10 + (s[idx++] - '0');
+		}
+		*bg_out = bg;
+	}
+	return idx;
+}
+
+static void format_irc_text(const char *src, char *dst, size_t dst_size) {
+	bool bold = false;
+	bool italic = false;
+	bool underline = false;
+	bool strike = false;
+	bool reverse = false;
+	int fg = -1;
+	int bg = -1;
+
+	size_t out = 0;
+	#define APPEND(...) do { \
+		if (out < dst_size - 1) { \
+			int w = snprintf(dst + out, dst_size - out, __VA_ARGS__); \
+			if (w > 0) out += (size_t)w; \
+		} \
+	} while (0)
+
+	for (size_t i = 0; src[i] != '\0' && out < dst_size - 16; ) {
+		unsigned char c = (unsigned char)src[i];
+		bool state_changed = false;
+
+		if (c == 0x02) {
+			bold = !bold;
+			i++;
+			state_changed = true;
+		} else if (c == 0x1D) {
+			italic = !italic;
+			i++;
+			state_changed = true;
+		} else if (c == 0x1F) {
+			underline = !underline;
+			i++;
+			state_changed = true;
+		} else if (c == 0x1E) {
+			strike = !strike;
+			i++;
+			state_changed = true;
+		} else if (c == 0x16) {
+			reverse = !reverse;
+			i++;
+			state_changed = true;
+		} else if (c == 0x0F) {
+			bold = italic = underline = strike = reverse = false;
+			fg = bg = -1;
+			i++;
+			state_changed = true;
+		} else if (c == 0x03) {
+			int nfg, nbg;
+			i += parse_irc_color_seq(src + i, &nfg, &nbg);
+			if (nfg < 0) {
+				fg = -1;
+				bg = -1;
+			} else {
+				fg = nfg;
+				if (nbg >= 0) {
+					bg = nbg;
+				}
+			}
+			state_changed = true;
+		} else if (c < 32 && c != '\t') {
+			i++;
+			continue;
+		} else {
+			dst[out++] = src[i++];
+			continue;
+		}
+
+		if (state_changed) {
+			APPEND("\x1b[0m");
+			if (bold) APPEND("\x1b[1m");
+			if (italic) APPEND("\x1b[3m");
+			if (underline) APPEND("\x1b[4m");
+			if (reverse) APPEND("\x1b[7m");
+			if (strike) APPEND("\x1b[9m");
+			if (fg >= 0 && fg <= 98) {
+				unsigned int mapped = fg < 16 ? mirc_ansi_palette[fg] : (unsigned int)fg;
+				APPEND("\x1b[38;5;%um", mapped);
+			}
+			if (bg >= 0 && bg <= 98) {
+				unsigned int mapped = bg < 16 ? mirc_ansi_palette[bg] : (unsigned int)bg;
+				APPEND("\x1b[48;5;%um", mapped);
+			}
+		}
+	}
+
+	APPEND("\x1b[0m");
+	dst[out] = '\0';
+	#undef APPEND
 }
 
 static unsigned int nick_color(const char *nick) {
@@ -224,7 +380,7 @@ static void delete_prev_word(UiState *ui) {
 		pos--;
 	}
 	while (pos > 0 && !isspace((unsigned char)ui->input[pos - 1])) {
-		pos--;
+		pos = utf8_prev_cp(ui->input, pos);
 	}
 	memmove(ui->input + pos, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
 	ui->input_len -= (ui->cursor - pos);
@@ -232,16 +388,35 @@ static void delete_prev_word(UiState *ui) {
 }
 
 static size_t next_wrap_chunk(const char *text, size_t width) {
-	size_t len = strlen(text);
-	if (len <= width) {
-		return len;
-	}
-	for (size_t i = width; i > 0; i--) {
-		if (text[i] == ' ') {
-			return i;
+	size_t cols = 0;
+	size_t last_space = 0;
+	size_t i = 0;
+
+	while (text[i] != '\0') {
+		unsigned char c = (unsigned char)text[i];
+
+		if (c == 0x03) {
+			int fg, bg;
+			i += parse_irc_color_seq(text + i, &fg, &bg);
+			continue;
 		}
+		if (c < 32 && c != '\t') {
+			i++;
+			continue;
+		}
+
+		if (c == ' ') {
+			last_space = i;
+		}
+
+		size_t next_i = utf8_next_cp(text, strlen(text + i) + i, i);
+		if (cols + 1 > width) {
+			return last_space > 0 ? last_space : (i > 0 ? i : next_i);
+		}
+		cols++;
+		i = next_i;
 	}
-	return width;
+	return i;
 }
 
 void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
@@ -317,7 +492,7 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	size_t total = buf->line_count;
 	size_t end_idx = total > ui->scroll_offset ? total - ui->scroll_offset : 0;
 
-	char visual_rows[256][1024];
+	char visual_rows[256][1536];
 	int vcount = 0;
 
 	for (size_t i = end_idx; i > 0 && vcount < chat_rows; i--) {
@@ -332,7 +507,7 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 
 		int prefix_len = 6;
 		if (cl->kind == LINE_MSG || cl->kind == LINE_ACTION) {
-			prefix_len += (int)strlen(cl->sender) + 3;
+			prefix_len += (int)utf8_visual_cols(cl->sender, strlen(cl->sender)) + 3;
 		} else if (cl->kind == LINE_ERROR) {
 			prefix_len += 2;
 		} else {
@@ -345,7 +520,7 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 		}
 
 		const char *p = cl->text;
-		char line_chunks[32][1024];
+		char line_chunks[32][1536];
 		int chunk_count = 0;
 
 		if (*p == '\0') {
@@ -353,7 +528,9 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 		} else {
 			while (*p && chunk_count < 32) {
 				size_t take = next_wrap_chunk(p, (size_t)text_width);
-				snprintf(line_chunks[chunk_count++], sizeof(line_chunks[0]), "%.*s", (int)take, p);
+				char raw_slice[1024];
+				snprintf(raw_slice, sizeof(raw_slice), "%.*s", (int)take, p);
+				format_irc_text(raw_slice, line_chunks[chunk_count++], sizeof(line_chunks[0]));
 				p += take;
 				while (*p == ' ') {
 					p++;
@@ -423,10 +600,12 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 		}
 		EMIT("\x1b[K\x1b[0m\r\n");
 	} else {
+		char clean_topic[STATE_TEXT_LEN];
+		format_irc_text(buf->topic, clean_topic, sizeof(clean_topic));
 		EMIT(" [%s] %s (%zu users)%s%s%s\x1b[K\x1b[0m\r\n",
 		     st->nick, buf->name, buf->user_count,
 		     buf->topic[0] ? " | " : "",
-		     buf->topic[0] ? buf->topic : "",
+		     buf->topic[0] ? clean_topic : "",
 		     ui->scroll_offset > 0 ? " [SCROLL]" : "");
 	}
 
@@ -439,13 +618,21 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	}
 
 	size_t view_start = 0;
-	if ((int)ui->cursor >= avail) {
-		view_start = ui->cursor - (size_t)avail + 1;
+	while (utf8_visual_cols(ui->input + view_start, ui->cursor - view_start) >= (size_t)avail) {
+		view_start = utf8_next_cp(ui->input, ui->input_len, view_start);
 	}
 
-	EMIT("\x1b[2K\x1b[1m%s%s\x1b[0m%.*s", c_prompt, prompt, avail, ui->input + view_start);
+	size_t view_end = view_start;
+	size_t drawn_cols = 0;
+	while (view_end < ui->input_len && drawn_cols < (size_t)avail) {
+		view_end = utf8_next_cp(ui->input, ui->input_len, view_end);
+		drawn_cols++;
+	}
 
-	int cursor_col = plen + (int)(ui->cursor - view_start) + 1;
+	EMIT("\x1b[2K\x1b[1m%s%s\x1b[0m%.*s",
+	     c_prompt, prompt, (int)(view_end - view_start), ui->input + view_start);
+
+	int cursor_col = plen + (int)utf8_visual_cols(ui->input + view_start, ui->cursor - view_start) + 1;
 	EMIT("\x1b[%d;%dH\x1b[?25h", ui->rows, cursor_col);
 
 	#undef EMIT
@@ -455,7 +642,7 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 }
 
 UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua, char *out_line, size_t max_len) {
-	char seq[8];
+	char seq[16];
 	ssize_t n = read(STDIN_FILENO, seq, sizeof(seq));
 	if (n <= 0) {
 		return UI_ACTION_NONE;
@@ -470,9 +657,9 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 				ui->comp_active = true;
 				trigger_completion(ui, st, lua, true);
 			} else if (seq[2] == 'D' && ui->cursor > 0) {
-				ui->cursor--;
+				ui->cursor = utf8_prev_cp(ui->input, ui->cursor);
 			} else if (seq[2] == 'C' && ui->cursor < ui->input_len) {
-				ui->cursor++;
+				ui->cursor = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
 			} else if (seq[2] == 'H') {
 				ui->cursor = 0;
 			} else if (seq[2] == 'F') {
@@ -483,8 +670,9 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 				} else if (seq[2] == '6') {
 					ui->scroll_offset = ui->scroll_offset > 10 ? ui->scroll_offset - 10 : 0;
 				} else if (seq[2] == '3' && ui->cursor < ui->input_len) {
-					memmove(ui->input + ui->cursor, ui->input + ui->cursor + 1, ui->input_len - ui->cursor);
-					ui->input_len--;
+					size_t next = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
+					memmove(ui->input + ui->cursor, ui->input + next, ui->input_len - next + 1);
+					ui->input_len -= (next - ui->cursor);
 				}
 			}
 			return UI_ACTION_NONE;
@@ -497,9 +685,9 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 		} else if (alt == 'k') {
 			ui->scroll_offset += 1;
 		} else if (alt == 'h' && ui->cursor > 0) {
-			ui->cursor--;
+			ui->cursor = utf8_prev_cp(ui->input, ui->cursor);
 		} else if (alt == 'l' && ui->cursor < ui->input_len) {
-			ui->cursor++;
+			ui->cursor = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
 		} else if (alt == 'n') {
 			ui->scroll_offset = 0;
 			return UI_ACTION_NEXT_BUF;
@@ -565,9 +753,10 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 
 		if (c == 127 || c == 8) {
 			if (ui->cursor > 0) {
-				memmove(ui->input + ui->cursor - 1, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
-				ui->cursor--;
-				ui->input_len--;
+				size_t prev = utf8_prev_cp(ui->input, ui->cursor);
+				memmove(ui->input + prev, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
+				ui->input_len -= (ui->cursor - prev);
+				ui->cursor = prev;
 			}
 			continue;
 		}
