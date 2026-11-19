@@ -10,7 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
+
+#define PING_IDLE_SEC    90
+#define PING_TIMEOUT_SEC 30
+#define BACKOFF_MIN_SEC  1
+#define BACKOFF_MAX_SEC  60
 
 static void base64_encode(const char *src, size_t len, char *dst, size_t dst_size) {
 	static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -69,7 +75,29 @@ static bool prompt_for_nick(UiState *ui, AppState *st, const LicTheme *theme, ch
 	}
 }
 
-static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *lua, IrcMessage *msg) {
+static void rejoin_open_channels(AppState *st, NetConn *conn, const struct LuaEngine *lua) {
+	for (size_t i = 0; i < st->buffer_count; i++) {
+		if (st->buffers[i].type == BUF_CHANNEL) {
+			irc_send_join(conn, st->buffers[i].name);
+		}
+	}
+	for (size_t i = 0; i < lua->config.auto_join_count; i++) {
+		bool already = false;
+		for (size_t j = 0; j < st->buffer_count; j++) {
+			if (st->buffers[j].type == BUF_CHANNEL &&
+			    strcasecmp(st->buffers[j].name, lua->config.auto_join[i]) == 0) {
+				already = true;
+				break;
+			}
+		}
+		if (!already) {
+			irc_send_join(conn, lua->config.auto_join[i]);
+			state_get_or_create_buffer(st, lua->config.auto_join[i], BUF_CHANNEL);
+		}
+	}
+}
+
+static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *lua, IrcMessage *msg, int *backoff_sec) {
 	if (strcmp(msg->command, "PING") == 0 && msg->param_count > 0) {
 		irc_send_raw(conn, "PONG :%s", msg->params[0]);
 		return;
@@ -125,16 +153,14 @@ static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *
 	Buffer *srv = &st->buffers[0];
 
 	if (strcmp(msg->command, "001") == 0) {
+		*backoff_sec = BACKOFF_MIN_SEC;
 		if (msg->param_count >= 1) {
 			snprintf(st->nick, sizeof(st->nick), "%s", msg->params[0]);
 		}
 		if (msg->param_count >= 2) {
 			buffer_push_line(srv, LINE_EVENT, "", msg->params[1], false);
 		}
-		for (size_t i = 0; i < lua->config.auto_join_count; i++) {
-			irc_send_join(conn, lua->config.auto_join[i]);
-			state_get_or_create_buffer(st, lua->config.auto_join[i], BUF_CHANNEL);
-		}
+		rejoin_open_channels(st, conn, lua);
 	} else if (strcmp(msg->command, "433") == 0) {
 		size_t len = strlen(st->nick);
 		if (len + 1 < sizeof(st->nick)) {
@@ -293,84 +319,161 @@ int main(void) {
 		snprintf(state->nick, sizeof(state->nick), "%s", lua.config.nick);
 	}
 
-	Buffer *srv = state_active_buffer(state);
-	buffer_push_line(srv, LINE_EVENT, "", "Connecting...", false);
-	ui_render(&ui, state, &lua.config.theme);
-
-	if (!net_connect(&conn, lua.config.host, lua.config.port, lua.config.tls)) {
-		buffer_push_line(srv, LINE_ERROR, "", "Connection failed", false);
-		ui_render(&ui, state, &lua.config.theme);
-		sleep(2);
-		lua_engine_close(&lua);
-		state_free(state);
-		free(state);
-		return 1;
-	}
-
-	irc_send_handshake(&conn, lua.config.nick, lua.config.user, lua.config.realname);
-
-	IrcLineBuf line_buf = {0};
-	struct pollfd pfds[2] = {
-		{.fd = STDIN_FILENO, .events = POLLIN},
-		{.fd = conn.fd,      .events = POLLIN}
-	};
-
+	Buffer *srv = &state->buffers[0];
 	char raw_buf[4096];
 	char line[IRC_MAX_LINE];
 	char input_line[UI_INPUT_MAX];
+	int backoff_sec = BACKOFF_MIN_SEC;
 	bool running = true;
 
-	while (running && conn.connected) {
-		if (poll(pfds, 2, 100) < 0) {
-			if (ui.dirty) {
-				ui_render(&ui, state, &lua.config.theme);
+	while (running) {
+		char msg_buf[256];
+		snprintf(msg_buf, sizeof(msg_buf), "Connecting to %s:%s...", lua.config.host, lua.config.port);
+		buffer_push_line(srv, LINE_EVENT, "", msg_buf, false);
+		ui_render(&ui, state, &lua.config.theme);
+
+		if (!net_connect(&conn, lua.config.host, lua.config.port, lua.config.tls)) {
+			snprintf(msg_buf, sizeof(msg_buf), "Connection failed. Reconnecting in %ds...", backoff_sec);
+			buffer_push_line(srv, LINE_ERROR, "", msg_buf, false);
+			ui.dirty = true;
+
+			time_t wait_until = time(NULL) + backoff_sec;
+			while (running && time(NULL) < wait_until) {
+				struct pollfd spfd = {.fd = STDIN_FILENO, .events = POLLIN};
+				if (poll(&spfd, 1, 100) > 0 && (spfd.revents & POLLIN)) {
+					UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
+					if (act == UI_ACTION_QUIT) {
+						running = false;
+					} else if (act == UI_ACTION_NEXT_BUF) {
+						state_next_buffer(state);
+					} else if (act == UI_ACTION_PREV_BUF) {
+						state_prev_buffer(state);
+					} else if (act == UI_ACTION_SWITCH_BUF) {
+						state_switch_buffer(state, ui.target_buf_idx);
+					} else if (act == UI_ACTION_SUBMIT && !cmd_execute(state, &conn, &lua, input_line)) {
+						running = false;
+					}
+				}
+				if (ui.dirty) {
+					ui_render(&ui, state, &lua.config.theme);
+				}
+			}
+
+			backoff_sec *= 2;
+			if (backoff_sec > BACKOFF_MAX_SEC) {
+				backoff_sec = BACKOFF_MAX_SEC;
 			}
 			continue;
 		}
 
-		if (pfds[1].revents & POLLIN) {
-			ssize_t n = net_read(&conn, raw_buf, sizeof(raw_buf));
-			if (n < 0) {
-				buffer_push_line(srv, LINE_ERROR, "", "Disconnected from server", false);
-				ui.dirty = true;
-				break;
+		irc_send_handshake(&conn, lua.config.nick, lua.config.user, lua.config.realname);
+
+		IrcLineBuf line_buf = {0};
+		time_t last_rx = time(NULL);
+		time_t ping_sent_at = 0;
+
+		while (running && conn.connected) {
+			struct pollfd pfds[2] = {
+				{.fd = STDIN_FILENO, .events = POLLIN},
+				{.fd = conn.fd,      .events = POLLIN}
+			};
+
+			if (poll(pfds, 2, 100) < 0) {
+				if (ui.dirty) {
+					ui_render(&ui, state, &lua.config.theme);
+				}
+				continue;
 			}
-			if (n > 0) {
-				irc_buf_push(&line_buf, raw_buf, (size_t)n);
-				while (irc_buf_pop_line(&line_buf, line, sizeof(line))) {
-					IrcMessage msg;
-					if (irc_parse_line(line, &msg)) {
-						dispatch_irc_message(state, &conn, &lua, &msg);
-						ui.dirty = true;
+
+			time_t now = time(NULL);
+
+			if (pfds[1].revents & POLLIN) {
+				ssize_t n = net_read(&conn, raw_buf, sizeof(raw_buf));
+				if (n < 0) {
+					buffer_push_line(srv, LINE_ERROR, "", "Disconnected from server", false);
+					ui.dirty = true;
+					break;
+				}
+				if (n > 0) {
+					last_rx = now;
+					ping_sent_at = 0;
+					irc_buf_push(&line_buf, raw_buf, (size_t)n);
+					while (irc_buf_pop_line(&line_buf, line, sizeof(line))) {
+						IrcMessage msg;
+						if (irc_parse_line(line, &msg)) {
+							dispatch_irc_message(state, &conn, &lua, &msg, &backoff_sec);
+							ui.dirty = true;
+						}
 					}
 				}
 			}
-		}
 
-		if (pfds[0].revents & POLLIN) {
-			UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
-			if (act == UI_ACTION_QUIT) {
-				irc_send_raw(&conn, "QUIT :lic");
-				running = false;
-			} else if (act == UI_ACTION_NEXT_BUF) {
-				state_next_buffer(state);
-			} else if (act == UI_ACTION_PREV_BUF) {
-				state_prev_buffer(state);
-			} else if (act == UI_ACTION_SWITCH_BUF) {
-				state_switch_buffer(state, ui.target_buf_idx);
-			} else if (act == UI_ACTION_SUBMIT) {
-				if (!cmd_execute(state, &conn, &lua, input_line)) {
+			if (pfds[0].revents & POLLIN) {
+				UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
+				if (act == UI_ACTION_QUIT) {
+					irc_send_raw(&conn, "QUIT :lic");
+					running = false;
+				} else if (act == UI_ACTION_NEXT_BUF) {
+					state_next_buffer(state);
+				} else if (act == UI_ACTION_PREV_BUF) {
+					state_prev_buffer(state);
+				} else if (act == UI_ACTION_SWITCH_BUF) {
+					state_switch_buffer(state, ui.target_buf_idx);
+				} else if (act == UI_ACTION_SUBMIT && !cmd_execute(state, &conn, &lua, input_line)) {
 					running = false;
 				}
 			}
+
+			if (ping_sent_at == 0 && (now - last_rx) >= PING_IDLE_SEC) {
+				irc_send_raw(&conn, "PING :lic-keepalive");
+				ping_sent_at = now;
+			} else if (ping_sent_at != 0 && (now - ping_sent_at) >= PING_TIMEOUT_SEC) {
+				buffer_push_line(srv, LINE_ERROR, "", "Ping timeout from server", false);
+				ui.dirty = true;
+				break;
+			}
+
+			if (ui.dirty) {
+				ui_render(&ui, state, &lua.config.theme);
+			}
 		}
 
-		if (ui.dirty) {
-			ui_render(&ui, state, &lua.config.theme);
+		net_close(&conn);
+
+		if (running) {
+			snprintf(msg_buf, sizeof(msg_buf), "Reconnecting in %ds...", backoff_sec);
+			buffer_push_line(srv, LINE_EVENT, "", msg_buf, false);
+			ui.dirty = true;
+
+			time_t wait_until = time(NULL) + backoff_sec;
+			while (running && time(NULL) < wait_until) {
+				struct pollfd spfd = {.fd = STDIN_FILENO, .events = POLLIN};
+				if (poll(&spfd, 1, 100) > 0 && (spfd.revents & POLLIN)) {
+					UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
+					if (act == UI_ACTION_QUIT) {
+						running = false;
+					} else if (act == UI_ACTION_NEXT_BUF) {
+						state_next_buffer(state);
+					} else if (act == UI_ACTION_PREV_BUF) {
+						state_prev_buffer(state);
+					} else if (act == UI_ACTION_SWITCH_BUF) {
+						state_switch_buffer(state, ui.target_buf_idx);
+					} else if (act == UI_ACTION_SUBMIT && !cmd_execute(state, &conn, &lua, input_line)) {
+						running = false;
+					}
+				}
+				if (ui.dirty) {
+					ui_render(&ui, state, &lua.config.theme);
+				}
+			}
+
+			backoff_sec *= 2;
+			if (backoff_sec > BACKOFF_MAX_SEC) {
+				backoff_sec = BACKOFF_MAX_SEC;
+			}
 		}
 	}
 
-	net_close(&conn);
 	lua_engine_close(&lua);
 	state_free(state);
 	free(state);
