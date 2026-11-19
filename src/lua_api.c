@@ -5,11 +5,14 @@
 #include <dirent.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define MAX_LUA_TIMERS 32
 
@@ -37,6 +40,46 @@ static void clear_timers(lua_State *L) {
 		}
 		g_timers[i].active = false;
 	}
+}
+
+static const char *resolve_home_dir(void) {
+	const char *home = getenv("HOME");
+	if (home && home[0] != '\0') {
+		return home;
+	}
+	struct passwd *pw = getpwuid(getuid());
+	if (pw && pw->pw_dir && pw->pw_dir[0] != '\0') {
+		return pw->pw_dir;
+	}
+	return ".";
+}
+
+static void resolve_user_paths(char *init_out, size_t init_sz, char *plugins_out, size_t plugins_sz) {
+	const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
+	const char *xdg_data = getenv("XDG_DATA_HOME");
+	const char *home = resolve_home_dir();
+
+	if (xdg_cfg && xdg_cfg[0] != '\0') {
+		snprintf(init_out, init_sz, "%s/lic/init.lua", xdg_cfg);
+	} else {
+		snprintf(init_out, init_sz, "%s/.config/lic/init.lua", home);
+	}
+
+	if (xdg_data && xdg_data[0] != '\0') {
+		snprintf(plugins_out, plugins_sz, "%s/lic/plugins", xdg_data);
+	} else {
+		snprintf(plugins_out, plugins_sz, "%s/.local/share/lic/plugins", home);
+	}
+}
+
+static bool file_exists(const char *path) {
+	struct stat st;
+	return path && path[0] != '\0' && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool dir_exists(const char *path) {
+	struct stat st;
+	return path && path[0] != '\0' && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static LicColor make_ansi(uint8_t idx) {
@@ -463,9 +506,10 @@ static int cmp_str_ptr(const void *a, const void *b) {
 }
 
 static void load_plugins_from_dir(struct LuaEngine *eng) {
-	if (!eng->plugin_dir[0]) {
+	if (!eng->plugin_dir[0] || !dir_exists(eng->plugin_dir)) {
 		return;
 	}
+
 	DIR *d = opendir(eng->plugin_dir);
 	if (!d) {
 		return;
@@ -546,7 +590,7 @@ bool lua_reload(struct LuaEngine *eng) {
 	luaL_openlibs(eng->L);
 	setup_lua_globals(eng->L);
 
-	if (eng->script_path[0] != '\0') {
+	if (file_exists(eng->script_path)) {
 		if (luaL_dofile(eng->L, eng->script_path) != LUA_OK) {
 			Buffer *b = state_active_buffer(eng->state);
 			if (b) {
@@ -563,17 +607,16 @@ bool lua_reload(struct LuaEngine *eng) {
 }
 
 bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path, const char *plugin_dir) {
+	(void)script_path;
+	(void)plugin_dir;
+
 	memset(eng, 0, sizeof(*eng));
 	eng->state = st;
 	eng->conn = conn;
 	g_eng = eng;
 
-	if (script_path) {
-		snprintf(eng->script_path, sizeof(eng->script_path), "%s", script_path);
-	}
-	if (plugin_dir) {
-		snprintf(eng->plugin_dir, sizeof(eng->plugin_dir), "%s", plugin_dir);
-	}
+	resolve_user_paths(eng->script_path, sizeof(eng->script_path),
+	                   eng->plugin_dir, sizeof(eng->plugin_dir));
 
 	config_set_defaults(&eng->config);
 	return lua_reload(eng);
