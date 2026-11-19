@@ -7,7 +7,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
+
+static uint64_t monotonic_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
 
 static struct LuaEngine *get_engine(lua_State *L) {
 	lua_getfield(L, LUA_REGISTRYINDEX, "lic_engine");
@@ -108,6 +115,32 @@ static int l_command(lua_State *L) {
 	lua_pushvalue(L, 2);
 	lua_setfield(L, -2, name);
 	lua_pop(L, 1);
+	return 0;
+}
+
+static int l_every(lua_State *L) {
+	lua_Integer ms = luaL_checkinteger(L, 1);
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	if (ms < 10) {
+		ms = 10;
+	}
+
+	lua_getfield(L, LUA_REGISTRYINDEX, "lic_timers");
+	int len = (int)lua_rawlen(L, -1);
+
+	lua_newtable(L);
+	lua_pushvalue(L, 2);
+	lua_setfield(L, -2, "fn");
+
+	lua_pushinteger(L, ms);
+	lua_setfield(L, -2, "interval_ms");
+
+	lua_Integer next_at = (lua_Integer)(monotonic_ms() + (uint64_t)ms);
+	lua_pushinteger(L, next_at);
+	lua_setfield(L, -2, "next_ms");
+
+	lua_rawseti(L, -2, len + 1);
+	lua_pop(L, 2);
 	return 0;
 }
 
@@ -293,6 +326,9 @@ static void register_api(struct LuaEngine *eng) {
 	lua_newtable(L);
 	lua_setfield(L, LUA_REGISTRYINDEX, "lic_commands");
 
+	lua_newtable(L);
+	lua_setfield(L, LUA_REGISTRYINDEX, "lic_timers");
+
 	static const luaL_Reg funcs[] = {
 		{"send_raw",      l_send_raw},
 		{"privmsg",       l_privmsg},
@@ -303,6 +339,7 @@ static void register_api(struct LuaEngine *eng) {
 		{"buffers",       l_buffers},
 		{"on",            l_on},
 		{"command",       l_command},
+		{"every",         l_every},
 		{NULL,            NULL}
 	};
 
@@ -590,4 +627,61 @@ size_t lua_list_commands(struct LuaEngine *eng, const char **out, size_t max) {
 	}
 	lua_pop(L, 1);
 	return count;
+}
+
+void lua_tick_timers(struct LuaEngine *eng, bool *dirty) {
+	if (!eng || !eng->L) {
+		return;
+	}
+	lua_State *L = eng->L;
+	uint64_t now = monotonic_ms();
+
+	lua_getfield(L, LUA_REGISTRYINDEX, "lic_timers");
+	if (!lua_istable(L, -1)) {
+		lua_pop(L, 1);
+		return;
+	}
+
+	int len = (int)lua_rawlen(L, -1);
+	for (int i = 1; i <= len; i++) {
+		lua_rawgeti(L, -1, i);
+		if (!lua_istable(L, -1)) {
+			lua_pop(L, 1);
+			continue;
+		}
+
+		lua_getfield(L, -1, "next_ms");
+		uint64_t next_ms = (uint64_t)lua_tointeger(L, -1);
+		lua_pop(L, 1);
+
+		if (now >= next_ms) {
+			lua_getfield(L, -1, "interval_ms");
+			uint64_t interval = (uint64_t)lua_tointeger(L, -1);
+			lua_pop(L, 1);
+
+			uint64_t updated = now + interval;
+			lua_pushinteger(L, (lua_Integer)updated);
+			lua_setfield(L, -2, "next_ms");
+
+			lua_getfield(L, -1, "fn");
+			if (lua_isfunction(L, -1)) {
+				if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+					Buffer *b = state_active_buffer(eng->state);
+					if (b) {
+						buffer_push_line(b, LINE_ERROR, "", lua_tostring(L, -1), false);
+					}
+					lua_pop(L, 1);
+				}
+				if (dirty) {
+					*dirty = true;
+				}
+			} else {
+				lua_pop(L, 1);
+			}
+		}
+
+		lua_pop(L, 1);
+	}
+
+	lua_pop(L, 1);
 }

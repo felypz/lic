@@ -354,6 +354,7 @@ int main(void) {
 						running = false;
 					}
 				}
+				lua_tick_timers(&lua, &ui.dirty);
 				if (ui.dirty) {
 					ui_render(&ui, state, &lua.config.theme);
 				}
@@ -379,6 +380,7 @@ int main(void) {
 			};
 
 			if (poll(pfds, 2, 100) < 0) {
+				lua_tick_timers(&lua, &ui.dirty);
 				if (ui.dirty) {
 					ui_render(&ui, state, &lua.config.theme);
 				}
@@ -433,6 +435,8 @@ int main(void) {
 				break;
 			}
 
+			lua_tick_timers(&lua, &ui.dirty);
+
 			if (ui.dirty) {
 				ui_render(&ui, state, &lua.config.theme);
 			}
@@ -462,6 +466,7 @@ int main(void) {
 						running = false;
 					}
 				}
+				lua_tick_timers(&lua, &ui.dirty);
 				if (ui.dirty) {
 					ui_render(&ui, state, &lua.config.theme);
 				}

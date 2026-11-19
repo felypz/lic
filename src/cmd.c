@@ -1,4 +1,6 @@
 #include "cmd.h"
+#include "irc.h"
+#include "lua_api.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -37,10 +39,6 @@ static void send_chunked_privmsg(AppState *st, NetConn *conn, const char *target
 		return;
 	}
 
-	/*
-	 * Reserva 120 bytes para o prefixo retransmitido pelo servidor
-	 * (:nick!user@host PRIVMSG <target> :<text>\r\n <= 512 bytes)
-	 */
 	size_t overhead = strlen("PRIVMSG  :\r\n") + strlen(target) + 120;
 	size_t max_payload = overhead < 480 ? (510 - overhead) : 256;
 

@@ -983,7 +983,7 @@ static UiAction handle_normal_key(UiState *ui, const AppState *st, unsigned char
 		return UI_ACTION_NONE;
 	}
 
-	if (op == 23) { /* Ctrl+W window prefix */
+	if (op == 23) {
 		if (c == 'v' || c == 's') {
 			ui->split_enabled = !ui->split_enabled;
 		} else if (c == 'c' || c == 'q') {
@@ -1080,9 +1080,9 @@ static UiAction handle_normal_key(UiState *ui, const AppState *st, unsigned char
 		ui->scroll_offset = ui->scroll_offset > 0 ? ui->scroll_offset - 1 : 0;
 	} else if (c == 'k') {
 		ui->scroll_offset += 1;
-	} else if (c == 4) { /* Ctrl+D: half page down */
+	} else if (c == 4) {
 		ui->scroll_offset = ui->scroll_offset > 10 ? ui->scroll_offset - 10 : 0;
-	} else if (c == 21) { /* Ctrl+U: half page up */
+	} else if (c == 21) {
 		ui->scroll_offset += 10;
 	} else if (c == 'G') {
 		ui->scroll_offset = 0;
@@ -1092,9 +1092,9 @@ static UiAction handle_normal_key(UiState *ui, const AppState *st, unsigned char
 	} else if (c == 'K') {
 		ui->scroll_offset = 0;
 		return UI_ACTION_PREV_BUF;
-	} else if (c == 16) { /* Ctrl+P: history prev */
+	} else if (c == 16) {
 		history_prev(ui);
-	} else if (c == 14) { /* Ctrl+N: history next */
+	} else if (c == 14) {
 		history_next(ui);
 	} else if (c >= '1' && c <= '9') {
 		ui->scroll_offset = 0;
