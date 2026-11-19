@@ -6,7 +6,7 @@ lic.config = {
 	user = "lic",
 	realname = "Lunar IRC Client",
 	history_size = 1024,
-	channels = { "#lic-test" },
+	channels = {},
 }
 
 lic.theme = {

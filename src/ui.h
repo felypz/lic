@@ -20,9 +20,16 @@ typedef enum {
 	UI_ACTION_QUIT
 } UiAction;
 
+typedef enum {
+	UI_MODE_INSERT,
+	UI_MODE_NORMAL
+} UiMode;
+
 typedef struct {
 	int rows;
 	int cols;
+	UiMode mode;
+	char pending_op;
 	char input[UI_INPUT_MAX];
 	size_t input_len;
 	size_t cursor;
@@ -30,6 +37,9 @@ typedef struct {
 	size_t target_buf_idx;
 	char prompt_label[64];
 	bool dirty;
+
+	bool split_enabled;
+	size_t split_buf_idx;
 
 	char history[UI_HIST_MAX][UI_INPUT_MAX];
 	size_t hist_count;
@@ -50,5 +60,8 @@ void ui_shutdown(void);
 void ui_update_size(UiState *ui);
 void ui_render(UiState *ui, const AppState *st, const LicTheme *theme);
 UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua, char *out_line, size_t max_len);
+
+bool ui_clipboard_copy(const char *text);
+bool ui_clipboard_paste(char *dst, size_t dst_size);
 
 #endif

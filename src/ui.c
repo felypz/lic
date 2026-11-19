@@ -1,12 +1,14 @@
 #include "ui.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -33,7 +35,7 @@ void ui_shutdown(void) {
 		tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 		termios_saved = false;
 	}
-	const char *cleanup = "\x1b[?25h\x1b[0m\x1b[?1049l";
+	const char *cleanup = "\x1b[?25h\x1b[2 q\x1b[0m\x1b[?1049l";
 	write(STDOUT_FILENO, cleanup, strlen(cleanup));
 }
 
@@ -51,6 +53,7 @@ void ui_update_size(UiState *ui) {
 
 bool ui_init(UiState *ui) {
 	memset(ui, 0, sizeof(*ui));
+	ui->mode = UI_MODE_INSERT;
 
 	if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) {
 		return false;
@@ -79,6 +82,134 @@ bool ui_init(UiState *ui) {
 
 	ui_update_size(ui);
 	return true;
+}
+
+static bool is_wayland(void) {
+	const char *wd = getenv("WAYLAND_DISPLAY");
+	return wd && wd[0] != '\0';
+}
+
+bool ui_clipboard_copy(const char *text) {
+	if (!text) {
+		return false;
+	}
+	int pipefd[2];
+	if (pipe(pipefd) != 0) {
+		return false;
+	}
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return false;
+	}
+
+	if (pid == 0) {
+		close(pipefd[1]);
+		dup2(pipefd[0], STDIN_FILENO);
+		close(pipefd[0]);
+
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+
+		if (is_wayland()) {
+			execlp("wl-copy", "wl-copy", (char *)NULL);
+		}
+		execlp("xclip", "xclip", "-selection", "clipboard", (char *)NULL);
+		execlp("xsel", "xsel", "--clipboard", "--input", (char *)NULL);
+		_exit(127);
+	}
+
+	close(pipefd[0]);
+	size_t len = strlen(text);
+	size_t sent = 0;
+	while (sent < len) {
+		ssize_t w = write(pipefd[1], text + sent, len - sent);
+		if (w <= 0) {
+			break;
+		}
+		sent += (size_t)w;
+	}
+	close(pipefd[1]);
+
+	int status = 0;
+	waitpid(pid, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+bool ui_clipboard_paste(char *dst, size_t dst_size) {
+	if (!dst || dst_size == 0) {
+		return false;
+	}
+	int pipefd[2];
+	if (pipe(pipefd) != 0) {
+		return false;
+	}
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return false;
+	}
+
+	if (pid == 0) {
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+
+		if (is_wayland()) {
+			execlp("wl-paste", "wl-paste", "--no-newline", (char *)NULL);
+		}
+		execlp("xclip", "xclip", "-selection", "clipboard", "-o", (char *)NULL);
+		execlp("xsel", "xsel", "--clipboard", "--output", (char *)NULL);
+		_exit(127);
+	}
+
+	close(pipefd[1]);
+	size_t total = 0;
+	while (total + 1 < dst_size) {
+		ssize_t r = read(pipefd[0], dst + total, dst_size - 1 - total);
+		if (r <= 0) {
+			break;
+		}
+		total += (size_t)r;
+	}
+	dst[total] = '\0';
+	close(pipefd[0]);
+
+	int status = 0;
+	waitpid(pid, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0 && total > 0;
+}
+
+static void insert_text_at_cursor(UiState *ui, const char *text) {
+	if (!text || text[0] == '\0') {
+		return;
+	}
+	for (size_t i = 0; text[i] != '\0' && ui->input_len < UI_INPUT_MAX - 1; i++) {
+		unsigned char c = (unsigned char)text[i];
+		if (c == '\r' || c == '\n') {
+			continue;
+		}
+		if (c >= 32 || (c & 0x80) != 0) {
+			memmove(ui->input + ui->cursor + 1, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
+			ui->input[ui->cursor] = (char)c;
+			ui->cursor++;
+			ui->input_len++;
+		}
+	}
 }
 
 static bool is_utf8_cont(unsigned char c) {
@@ -449,6 +580,23 @@ static size_t word_next_pos(const char *s, size_t len, size_t pos) {
 	return pos;
 }
 
+static size_t word_end_pos(const char *s, size_t len, size_t pos) {
+	if (pos < len) {
+		pos = utf8_next_cp(s, len, pos);
+	}
+	while (pos < len && isspace((unsigned char)s[pos])) {
+		pos++;
+	}
+	while (pos < len && !isspace((unsigned char)s[pos])) {
+		size_t next = utf8_next_cp(s, len, pos);
+		if (next >= len || isspace((unsigned char)s[next])) {
+			break;
+		}
+		pos = next;
+	}
+	return pos;
+}
+
 static void delete_prev_word(UiState *ui) {
 	if (ui->cursor == 0) {
 		return;
@@ -466,6 +614,12 @@ static void delete_next_word(UiState *ui) {
 	size_t pos = word_next_pos(ui->input, ui->input_len, ui->cursor);
 	memmove(ui->input + ui->cursor, ui->input + pos, ui->input_len - pos + 1);
 	ui->input_len -= (pos - ui->cursor);
+}
+
+static void clamp_normal_cursor(UiState *ui) {
+	if (ui->mode == UI_MODE_NORMAL && ui->input_len > 0 && ui->cursor >= ui->input_len) {
+		ui->cursor = utf8_prev_cp(ui->input, ui->input_len);
+	}
 }
 
 static size_t next_wrap_chunk(const char *text, size_t width) {
@@ -500,6 +654,107 @@ static size_t next_wrap_chunk(const char *text, size_t width) {
 	return i;
 }
 
+static void render_buffer_pane(const Buffer *buf, int width, int chat_rows, size_t scroll_offset,
+                               const char *c_ts, const char *c_mention, const char *c_event,
+                               const char *c_err, const char *c_act,
+                               char out_rows[][1536], int *out_count) {
+	*out_count = 0;
+	if (!buf || width < 12 || chat_rows < 1) {
+		return;
+	}
+
+	size_t total = buf->line_count;
+	size_t end_idx = total > scroll_offset ? total - scroll_offset : 0;
+	char temp_rows[256][1536];
+	int tcount = 0;
+
+	for (size_t i = end_idx; i > 0 && tcount < chat_rows; i--) {
+		const ChatLine *cl = buffer_get_line(buf, i - 1);
+		if (!cl) {
+			continue;
+		}
+
+		struct tm *tm_info = localtime(&cl->timestamp);
+		char ts[16];
+		strftime(ts, sizeof(ts), "%H:%M", tm_info);
+
+		int prefix_len = 6;
+		if (cl->kind == LINE_MSG || cl->kind == LINE_ACTION) {
+			prefix_len += (int)utf8_visual_cols(cl->sender, strlen(cl->sender)) + 3;
+		} else if (cl->kind == LINE_ERROR) {
+			prefix_len += 2;
+		} else {
+			prefix_len += 3;
+		}
+
+		int text_width = width - prefix_len;
+		if (text_width < 8) {
+			text_width = 8;
+		}
+
+		const char *p = cl->text;
+		char line_chunks[32][1536];
+		int chunk_count = 0;
+
+		if (*p == '\0') {
+			line_chunks[chunk_count++][0] = '\0';
+		} else {
+			while (*p && chunk_count < 32) {
+				size_t take = next_wrap_chunk(p, (size_t)text_width);
+				char raw_slice[1024];
+				snprintf(raw_slice, sizeof(raw_slice), "%.*s", (int)take, p);
+				format_irc_text(raw_slice, line_chunks[chunk_count++], sizeof(line_chunks[0]));
+				p += take;
+				while (*p == ' ') {
+					p++;
+				}
+			}
+		}
+
+		for (int c = chunk_count - 1; c >= 0 && tcount < chat_rows; c--) {
+			if (c == 0) {
+				if (cl->kind == LINE_MSG) {
+					unsigned int col = nick_color(cl->sender);
+					if (cl->highlight) {
+						snprintf(temp_rows[tcount], sizeof(temp_rows[0]),
+						         "%s%s\x1b[0m \x1b[1m%s<%s>\x1b[0m \x1b[1m%s\x1b[0m",
+						         c_ts, ts, c_mention, cl->sender, line_chunks[c]);
+					} else {
+						snprintf(temp_rows[tcount], sizeof(temp_rows[0]),
+						         "%s%s\x1b[0m \x1b[%um<%s>\x1b[0m %s",
+						         c_ts, ts, col, cl->sender, line_chunks[c]);
+					}
+				} else if (cl->kind == LINE_ACTION) {
+					snprintf(temp_rows[tcount], sizeof(temp_rows[0]),
+					         "%s%s\x1b[0m %s* %s %s\x1b[0m",
+					         c_ts, ts, c_act, cl->sender, line_chunks[c]);
+				} else if (cl->kind == LINE_ERROR) {
+					snprintf(temp_rows[tcount], sizeof(temp_rows[0]),
+					         "%s%s\x1b[0m %s! %s\x1b[0m",
+					         c_ts, ts, c_err, line_chunks[c]);
+				} else {
+					snprintf(temp_rows[tcount], sizeof(temp_rows[0]),
+					         "%s%s\x1b[0m %s-- %s\x1b[0m",
+					         c_ts, ts, c_event, line_chunks[c]);
+				}
+			} else {
+				snprintf(temp_rows[tcount], sizeof(temp_rows[0]),
+				         "%*s%s", prefix_len, "", line_chunks[c]);
+			}
+			tcount++;
+		}
+	}
+
+	int idx = 0;
+	for (int i = tcount - 1; i >= 0; i--) {
+		snprintf(out_rows[idx++], 1536, "%s", temp_rows[i]);
+	}
+	while (idx < chat_rows) {
+		out_rows[idx++][0] = '\0';
+	}
+	*out_count = idx;
+}
+
 void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	if (resized_flag) {
 		resized_flag = 0;
@@ -510,6 +765,8 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	if (!buf) {
 		return;
 	}
+
+	clamp_normal_cursor(ui);
 
 	char c_bar_bg[32], c_bar_fg[32], c_act_bg[32], c_act_fg[32];
 	char c_unread[32], c_mention[32], c_ts[32], c_event[32], c_err[32], c_act[32], c_prompt[32];
@@ -570,97 +827,40 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 		chat_rows = 1;
 	}
 
-	size_t total = buf->line_count;
-	size_t end_idx = total > ui->scroll_offset ? total - ui->scroll_offset : 0;
-
-	char visual_rows[256][1536];
-	int vcount = 0;
-
-	for (size_t i = end_idx; i > 0 && vcount < chat_rows; i--) {
-		const ChatLine *cl = buffer_get_line(buf, i - 1);
-		if (!cl) {
-			continue;
+	bool active_split = ui->split_enabled && st->buffer_count > 1 && ui->cols >= 90;
+	if (active_split) {
+		int left_w = ui->cols / 2;
+		int right_w = ui->cols - left_w - 1;
+		size_t sidx = ui->split_buf_idx % st->buffer_count;
+		if (sidx == st->active_idx) {
+			sidx = (st->active_idx + 1) % st->buffer_count;
 		}
+		const Buffer *sbuf = &st->buffers[sidx];
 
-		struct tm *tm_info = localtime(&cl->timestamp);
-		char ts[16];
-		strftime(ts, sizeof(ts), "%H:%M", tm_info);
+		char left_rows[256][1536];
+		char right_rows[256][1536];
+		int lcount = 0, rcount = 0;
 
-		int prefix_len = 6;
-		if (cl->kind == LINE_MSG || cl->kind == LINE_ACTION) {
-			prefix_len += (int)utf8_visual_cols(cl->sender, strlen(cl->sender)) + 3;
-		} else if (cl->kind == LINE_ERROR) {
-			prefix_len += 2;
-		} else {
-			prefix_len += 3;
+		render_buffer_pane(buf, left_w, chat_rows, ui->scroll_offset,
+		                   c_ts, c_mention, c_event, c_err, c_act, left_rows, &lcount);
+		render_buffer_pane(sbuf, right_w, chat_rows, 0,
+		                   c_ts, c_mention, c_event, c_err, c_act, right_rows, &rcount);
+
+		for (int r = 0; r < chat_rows; r++) {
+			EMIT("\x1b[2K%s\x1b[0m\x1b[%dG%s│%s\x1b[0m\r\n",
+			     r < lcount ? left_rows[r] : "",
+			     left_w + 1,
+			     c_ts,
+			     r < rcount ? right_rows[r] : "");
 		}
-
-		int text_width = ui->cols - prefix_len;
-		if (text_width < 10) {
-			text_width = 10;
+	} else {
+		char rows_buf[256][1536];
+		int rcount = 0;
+		render_buffer_pane(buf, ui->cols, chat_rows, ui->scroll_offset,
+		                   c_ts, c_mention, c_event, c_err, c_act, rows_buf, &rcount);
+		for (int r = 0; r < chat_rows; r++) {
+			EMIT("\x1b[2K%s\r\n", r < rcount ? rows_buf[r] : "");
 		}
-
-		const char *p = cl->text;
-		char line_chunks[32][1536];
-		int chunk_count = 0;
-
-		if (*p == '\0') {
-			line_chunks[chunk_count++][0] = '\0';
-		} else {
-			while (*p && chunk_count < 32) {
-				size_t take = next_wrap_chunk(p, (size_t)text_width);
-				char raw_slice[1024];
-				snprintf(raw_slice, sizeof(raw_slice), "%.*s", (int)take, p);
-				format_irc_text(raw_slice, line_chunks[chunk_count++], sizeof(line_chunks[0]));
-				p += take;
-				while (*p == ' ') {
-					p++;
-				}
-			}
-		}
-
-		for (int c = chunk_count - 1; c >= 0 && vcount < chat_rows; c--) {
-			if (c == 0) {
-				if (cl->kind == LINE_MSG) {
-					unsigned int col = nick_color(cl->sender);
-					if (cl->highlight) {
-						snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
-						         "%s%s\x1b[0m \x1b[1m%s<%s>\x1b[0m \x1b[1m%s\x1b[0m",
-						         c_ts, ts, c_mention, cl->sender, line_chunks[c]);
-					} else {
-						snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
-						         "%s%s\x1b[0m \x1b[%um<%s>\x1b[0m %s",
-						         c_ts, ts, col, cl->sender, line_chunks[c]);
-					}
-				} else if (cl->kind == LINE_ACTION) {
-					snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
-					         "%s%s\x1b[0m %s* %s %s\x1b[0m",
-					         c_ts, ts, c_act, cl->sender, line_chunks[c]);
-				} else if (cl->kind == LINE_ERROR) {
-					snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
-					         "%s%s\x1b[0m %s! %s\x1b[0m",
-					         c_ts, ts, c_err, line_chunks[c]);
-				} else {
-					snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
-					         "%s%s\x1b[0m %s-- %s\x1b[0m",
-					         c_ts, ts, c_event, line_chunks[c]);
-				}
-			} else {
-				snprintf(visual_rows[vcount], sizeof(visual_rows[0]),
-				         "%*s%s", prefix_len, "", line_chunks[c]);
-			}
-			vcount++;
-		}
-	}
-
-	int drawn = 0;
-	for (int i = vcount - 1; i >= 0; i--) {
-		EMIT("\x1b[2K%s\r\n", visual_rows[i]);
-		drawn++;
-	}
-	while (drawn < chat_rows) {
-		EMIT("\x1b[2K\r\n");
-		drawn++;
 	}
 
 	EMIT("%s%s", c_bar_bg, c_bar_fg);
@@ -686,12 +886,16 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 		}
 		EMIT("\x1b[K\x1b[0m\r\n");
 	} else {
+		const char *mode_tag = ui->mode == UI_MODE_NORMAL ? "NORMAL" : "INSERT";
 		char clean_topic[STATE_TEXT_LEN];
 		format_irc_text(buf->topic, clean_topic, sizeof(clean_topic));
-		EMIT(" [%s] %s (%zu users)%s%s%s\x1b[K\x1b[0m\r\n",
+		EMIT("\x1b[1m%s%s %s \x1b[0m%s%s [%s] %s (%zu users)%s%s%s%s\x1b[K\x1b[0m\r\n",
+		     c_act_fg, c_act_bg, mode_tag,
+		     c_bar_bg, c_bar_fg,
 		     st->nick, buf->name, buf->user_count,
 		     buf->topic[0] ? " | " : "",
 		     buf->topic[0] ? clean_topic : "",
+		     active_split ? " [SPLIT]" : "",
 		     ui->scroll_offset > 0 ? " [SCROLL]" : "");
 	}
 
@@ -719,12 +923,195 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	     c_prompt, prompt, (int)(view_end - view_start), ui->input + view_start);
 
 	int cursor_col = plen + (int)utf8_visual_cols(ui->input + view_start, ui->cursor - view_start) + 1;
-	EMIT("\x1b[%d;%dH\x1b[?25h", ui->rows, cursor_col);
+	const char *cursor_shape = ui->mode == UI_MODE_NORMAL ? "\x1b[2 q" : "\x1b[6 q";
+	EMIT("\x1b[%d;%dH%s\x1b[?25h", ui->rows, cursor_col, cursor_shape);
 
 	#undef EMIT
 
 	write(STDOUT_FILENO, frame, pos);
 	ui->dirty = false;
+}
+
+static UiAction handle_normal_key(UiState *ui, const AppState *st, unsigned char c, char *out_line, size_t max_len) {
+	if (c == 3) {
+		return UI_ACTION_QUIT;
+	}
+
+	char op = ui->pending_op;
+	ui->pending_op = 0;
+
+	if (op == 'd') {
+		if (c == 'd') {
+			ui->input[0] = '\0';
+			ui->input_len = 0;
+			ui->cursor = 0;
+		} else if (c == 'w' || c == 'e') {
+			delete_next_word(ui);
+		} else if (c == 'b') {
+			delete_prev_word(ui);
+		} else if (c == '$') {
+			ui->input[ui->cursor] = '\0';
+			ui->input_len = ui->cursor;
+		} else if (c == '0') {
+			memmove(ui->input, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
+			ui->input_len -= ui->cursor;
+			ui->cursor = 0;
+		}
+		return UI_ACTION_NONE;
+	}
+
+	if (op == 'y') {
+		if (c == 'y') {
+			ui_clipboard_copy(ui->input);
+		}
+		return UI_ACTION_NONE;
+	}
+
+	if (op == 'g') {
+		if (c == 'g') {
+			const Buffer *buf = state_active_buffer((AppState *)st);
+			if (buf && buf->line_count > 0) {
+				ui->scroll_offset = buf->line_count - 1;
+			}
+		} else if (c == 't') {
+			ui->scroll_offset = 0;
+			return UI_ACTION_NEXT_BUF;
+		} else if (c == 'T') {
+			ui->scroll_offset = 0;
+			return UI_ACTION_PREV_BUF;
+		}
+		return UI_ACTION_NONE;
+	}
+
+	if (op == 23) { /* Ctrl+W window prefix */
+		if (c == 'v' || c == 's') {
+			ui->split_enabled = !ui->split_enabled;
+		} else if (c == 'c' || c == 'q') {
+			ui->split_enabled = false;
+		} else if (c == 'w' && st->buffer_count > 1) {
+			ui->split_buf_idx = (ui->split_buf_idx + 1) % st->buffer_count;
+		}
+		return UI_ACTION_NONE;
+	}
+
+	if (c == 'd' || c == 'y' || c == 'g' || c == 23) {
+		ui->pending_op = (char)c;
+		return UI_ACTION_NONE;
+	}
+
+	if (c == 'i') {
+		ui->mode = UI_MODE_INSERT;
+	} else if (c == 'a') {
+		if (ui->cursor < ui->input_len) {
+			ui->cursor = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
+		}
+		ui->mode = UI_MODE_INSERT;
+	} else if (c == 'I') {
+		ui->cursor = 0;
+		ui->mode = UI_MODE_INSERT;
+	} else if (c == 'A') {
+		ui->cursor = ui->input_len;
+		ui->mode = UI_MODE_INSERT;
+	} else if (c == ':' || c == '/') {
+		if (ui->input_len == 0) {
+			ui->input[0] = '/';
+			ui->input[1] = '\0';
+			ui->input_len = 1;
+			ui->cursor = 1;
+		}
+		ui->mode = UI_MODE_INSERT;
+	} else if (c == 'h') {
+		ui->cursor = utf8_prev_cp(ui->input, ui->cursor);
+	} else if (c == 'l') {
+		size_t next = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
+		if (next < ui->input_len) {
+			ui->cursor = next;
+		}
+	} else if (c == 'w') {
+		ui->cursor = word_next_pos(ui->input, ui->input_len, ui->cursor);
+	} else if (c == 'e') {
+		ui->cursor = word_end_pos(ui->input, ui->input_len, ui->cursor);
+	} else if (c == 'b') {
+		ui->cursor = word_prev_pos(ui->input, ui->cursor);
+	} else if (c == '0') {
+		ui->cursor = 0;
+	} else if (c == '^') {
+		size_t p = 0;
+		while (p < ui->input_len && isspace((unsigned char)ui->input[p])) {
+			p++;
+		}
+		ui->cursor = p;
+	} else if (c == '$') {
+		ui->cursor = ui->input_len;
+	} else if (c == 'x') {
+		if (ui->cursor < ui->input_len) {
+			size_t next = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
+			memmove(ui->input + ui->cursor, ui->input + next, ui->input_len - next + 1);
+			ui->input_len -= (next - ui->cursor);
+		}
+	} else if (c == 'X') {
+		if (ui->cursor > 0) {
+			size_t prev = utf8_prev_cp(ui->input, ui->cursor);
+			memmove(ui->input + prev, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
+			ui->input_len -= (ui->cursor - prev);
+			ui->cursor = prev;
+		}
+	} else if (c == 'D') {
+		ui->input[ui->cursor] = '\0';
+		ui->input_len = ui->cursor;
+	} else if (c == 'C') {
+		ui->input[ui->cursor] = '\0';
+		ui->input_len = ui->cursor;
+		ui->mode = UI_MODE_INSERT;
+	} else if (c == 'p') {
+		char pasted[UI_INPUT_MAX];
+		if (ui_clipboard_paste(pasted, sizeof(pasted))) {
+			if (ui->cursor < ui->input_len) {
+				ui->cursor = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
+			}
+			insert_text_at_cursor(ui, pasted);
+		}
+	} else if (c == 'P') {
+		char pasted[UI_INPUT_MAX];
+		if (ui_clipboard_paste(pasted, sizeof(pasted))) {
+			insert_text_at_cursor(ui, pasted);
+		}
+	} else if (c == 'j') {
+		ui->scroll_offset = ui->scroll_offset > 0 ? ui->scroll_offset - 1 : 0;
+	} else if (c == 'k') {
+		ui->scroll_offset += 1;
+	} else if (c == 4) { /* Ctrl+D: half page down */
+		ui->scroll_offset = ui->scroll_offset > 10 ? ui->scroll_offset - 10 : 0;
+	} else if (c == 21) { /* Ctrl+U: half page up */
+		ui->scroll_offset += 10;
+	} else if (c == 'G') {
+		ui->scroll_offset = 0;
+	} else if (c == 'J') {
+		ui->scroll_offset = 0;
+		return UI_ACTION_NEXT_BUF;
+	} else if (c == 'K') {
+		ui->scroll_offset = 0;
+		return UI_ACTION_PREV_BUF;
+	} else if (c == 16) { /* Ctrl+P: history prev */
+		history_prev(ui);
+	} else if (c == 14) { /* Ctrl+N: history next */
+		history_next(ui);
+	} else if (c >= '1' && c <= '9') {
+		ui->scroll_offset = 0;
+		ui->target_buf_idx = (size_t)(c - '1');
+		return UI_ACTION_SWITCH_BUF;
+	} else if (c == '\r' || c == '\n') {
+		snprintf(out_line, max_len, "%s", ui->input);
+		history_push(ui, ui->input);
+		ui->input_len = 0;
+		ui->cursor = 0;
+		ui->input[0] = '\0';
+		ui->scroll_offset = 0;
+		ui->mode = UI_MODE_INSERT;
+		return UI_ACTION_SUBMIT;
+	}
+
+	return UI_ACTION_NONE;
 }
 
 UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua, char *out_line, size_t max_len) {
@@ -738,8 +1125,11 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 
 	if (seq[0] == '\x1b') {
 		if (n == 1) {
+			ui->pending_op = 0;
 			if (ui->comp_active) {
 				cancel_completion(ui);
+			} else if (ui->mode == UI_MODE_INSERT) {
+				ui->mode = UI_MODE_NORMAL;
 			}
 			return UI_ACTION_NONE;
 		}
@@ -777,32 +1167,15 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			return UI_ACTION_NONE;
 		}
 
-		ui->comp_active = false;
-		char alt = seq[1];
-		if (alt == 'j') {
-			ui->scroll_offset = ui->scroll_offset > 0 ? ui->scroll_offset - 1 : 0;
-		} else if (alt == 'k') {
-			ui->scroll_offset += 1;
-		} else if (alt == 'h' && ui->cursor > 0) {
-			ui->cursor = utf8_prev_cp(ui->input, ui->cursor);
-		} else if (alt == 'l' && ui->cursor < ui->input_len) {
-			ui->cursor = utf8_next_cp(ui->input, ui->input_len, ui->cursor);
-		} else if (alt == 'b') {
-			ui->cursor = word_prev_pos(ui->input, ui->cursor);
-		} else if (alt == 'w' || alt == 'e' || alt == 'f') {
-			ui->cursor = word_next_pos(ui->input, ui->input_len, ui->cursor);
-		} else if (alt == 'd') {
-			delete_next_word(ui);
-		} else if (alt == 'n') {
-			ui->scroll_offset = 0;
-			return UI_ACTION_NEXT_BUF;
-		} else if (alt == 'p') {
-			ui->scroll_offset = 0;
-			return UI_ACTION_PREV_BUF;
-		} else if (alt >= '1' && alt <= '9') {
-			ui->scroll_offset = 0;
-			ui->target_buf_idx = (size_t)(alt - '1');
-			return UI_ACTION_SWITCH_BUF;
+		return UI_ACTION_NONE;
+	}
+
+	if (ui->mode == UI_MODE_NORMAL) {
+		for (ssize_t i = 0; i < n; i++) {
+			UiAction act = handle_normal_key(ui, st, (unsigned char)seq[i], out_line, max_len);
+			if (act != UI_ACTION_NONE) {
+				return act;
+			}
 		}
 		return UI_ACTION_NONE;
 	}
@@ -815,21 +1188,20 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			continue;
 		}
 
-		/* Vim wildmenu navigation while completion bar is open */
 		if (ui->comp_active) {
-			if (c == 14) { /* Ctrl+N: next match */
+			if (c == 14) {
 				trigger_completion(ui, st, lua, false);
 				continue;
 			}
-			if (c == 16) { /* Ctrl+P: previous match */
+			if (c == 16) {
 				trigger_completion(ui, st, lua, true);
 				continue;
 			}
-			if (c == 25) { /* Ctrl+Y: accept match and stay on input */
+			if (c == 25) {
 				ui->comp_active = false;
 				continue;
 			}
-			if (c == 5) {  /* Ctrl+E: abort wildmenu and restore original prefix */
+			if (c == 5) {
 				cancel_completion(ui);
 				continue;
 			}
@@ -840,33 +1212,20 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			return UI_ACTION_QUIT;
 		}
 		if (c == 14) {
-			ui->scroll_offset = 0;
-			return UI_ACTION_NEXT_BUF;
+			history_next(ui);
+			continue;
 		}
 		if (c == 16) {
-			ui->scroll_offset = 0;
-			return UI_ACTION_PREV_BUF;
-		}
-		if (c == 1) {
-			ui->cursor = 0;
+			history_prev(ui);
 			continue;
 		}
-		if (c == 5) {
-			ui->cursor = ui->input_len;
-			continue;
-		}
-		if (c == 11) { /* Ctrl+K: kill to end of line */
-			ui->input[ui->cursor] = '\0';
-			ui->input_len = ui->cursor;
-			continue;
-		}
-		if (c == 21) { /* Ctrl+U: kill whole line */
+		if (c == 21) {
 			ui->input_len = 0;
 			ui->cursor = 0;
 			ui->input[0] = '\0';
 			continue;
 		}
-		if (c == 23) { /* Ctrl+W: delete prev word */
+		if (c == 23) {
 			delete_prev_word(ui);
 			continue;
 		}
