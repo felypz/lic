@@ -64,7 +64,9 @@ struct LuaEngine {
 bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path, const char *plugin_dir);
 void lua_engine_close(struct LuaEngine *eng);
 bool lua_reload(struct LuaEngine *eng);
+void lua_sync_runtime(struct LuaEngine *eng);
 void lua_exec_string(struct LuaEngine *eng, const char *code);
+bool lua_exec_file(struct LuaEngine *eng, const char *path);
 bool lua_emit_message(struct LuaEngine *eng, const IrcMessage *msg);
 bool lua_emit_input(struct LuaEngine *eng, const char *input);
 bool lua_emit_command(struct LuaEngine *eng, const char *cmd, const char *arg);

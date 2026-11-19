@@ -159,9 +159,9 @@ bool ui_clipboard_paste(char *dst, size_t dst_size) {
 	}
 
 	if (pid == 0) {
-		close(pipefd[0]);
-		dup2(pipefd[1], STDOUT_FILENO);
 		close(pipefd[1]);
+		dup2(pipefd[0], STDOUT_FILENO);
+		close(pipefd[0]);
 
 		int devnull = open("/dev/null", O_WRONLY);
 		if (devnull >= 0) {
@@ -886,7 +886,8 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 		}
 		EMIT("\x1b[K\x1b[0m\r\n");
 	} else {
-		const char *mode_tag = ui->mode == UI_MODE_NORMAL ? "NORMAL" : "INSERT";
+		const char *mode_tag = ui->mode == UI_MODE_NORMAL  ? "NORMAL" :
+		                       ui->mode == UI_MODE_COMMAND ? "COMMAND" : "INSERT";
 		char clean_topic[STATE_TEXT_LEN];
 		format_irc_text(buf->topic, clean_topic, sizeof(clean_topic));
 		EMIT("\x1b[1m%s%s %s \x1b[0m%s%s [%s] %s (%zu users)%s%s%s%s\x1b[K\x1b[0m\r\n",
@@ -900,8 +901,14 @@ void ui_render(UiState *ui, const AppState *st, const LicTheme *theme) {
 	}
 
 	char prompt[STATE_NICK_LEN + 16];
-	const char *plabel = ui->prompt_label[0] ? ui->prompt_label : st->nick;
-	int plen = snprintf(prompt, sizeof(prompt), "[%s] ", plabel);
+	int plen;
+	if (ui->mode == UI_MODE_COMMAND) {
+		plen = snprintf(prompt, sizeof(prompt), ":");
+	} else {
+		const char *plabel = ui->prompt_label[0] ? ui->prompt_label : st->nick;
+		plen = snprintf(prompt, sizeof(prompt), "[%s] ", plabel);
+	}
+
 	int avail = ui->cols - plen - 1;
 	if (avail < 1) {
 		avail = 1;
@@ -1012,7 +1019,12 @@ static UiAction handle_normal_key(UiState *ui, const AppState *st, unsigned char
 	} else if (c == 'A') {
 		ui->cursor = ui->input_len;
 		ui->mode = UI_MODE_INSERT;
-	} else if (c == ':' || c == '/') {
+	} else if (c == ':') {
+		ui->input[0] = '\0';
+		ui->input_len = 0;
+		ui->cursor = 0;
+		ui->mode = UI_MODE_COMMAND;
+	} else if (c == '/') {
 		if (ui->input_len == 0) {
 			ui->input[0] = '/';
 			ui->input[1] = '\0';
@@ -1128,6 +1140,11 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 			ui->pending_op = 0;
 			if (ui->comp_active) {
 				cancel_completion(ui);
+			} else if (ui->mode == UI_MODE_COMMAND) {
+				ui->input[0] = '\0';
+				ui->input_len = 0;
+				ui->cursor = 0;
+				ui->mode = UI_MODE_NORMAL;
 			} else if (ui->mode == UI_MODE_INSERT) {
 				ui->mode = UI_MODE_NORMAL;
 			}
@@ -1184,7 +1201,9 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 		unsigned char c = (unsigned char)seq[i];
 
 		if (c == '\t') {
-			trigger_completion(ui, st, lua, false);
+			if (ui->mode != UI_MODE_COMMAND) {
+				trigger_completion(ui, st, lua, false);
+			}
 			continue;
 		}
 
@@ -1232,12 +1251,16 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 
 		if (c == '\r' || c == '\n') {
 			snprintf(out_line, max_len, "%s", ui->input);
-			history_push(ui, ui->input);
+			bool was_cmd_mode = (ui->mode == UI_MODE_COMMAND);
+			if (!was_cmd_mode) {
+				history_push(ui, ui->input);
+			}
 			ui->input_len = 0;
 			ui->cursor = 0;
 			ui->input[0] = '\0';
 			ui->scroll_offset = 0;
-			return UI_ACTION_SUBMIT;
+			ui->mode = was_cmd_mode ? UI_MODE_NORMAL : UI_MODE_INSERT;
+			return was_cmd_mode ? UI_ACTION_VIM_CMD : UI_ACTION_SUBMIT;
 		}
 
 		if (c == 127 || c == 8) {
@@ -1246,6 +1269,8 @@ UiAction ui_handle_stdin(UiState *ui, const AppState *st, struct LuaEngine *lua,
 				memmove(ui->input + prev, ui->input + ui->cursor, ui->input_len - ui->cursor + 1);
 				ui->input_len -= (ui->cursor - prev);
 				ui->cursor = prev;
+			} else if (ui->mode == UI_MODE_COMMAND && ui->input_len == 0) {
+				ui->mode = UI_MODE_NORMAL;
 			}
 			continue;
 		}

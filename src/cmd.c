@@ -1,79 +1,24 @@
 #include "cmd.h"
 #include "irc.h"
-#include "lua_api.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
-static bool is_utf8_cont(unsigned char c) {
-	return (c & 0xC0) == 0x80;
-}
-
-static size_t safe_utf8_split_len(const char *s, size_t max_bytes) {
-	size_t len = strlen(s);
-	if (len <= max_bytes) {
-		return len;
-	}
-
-	size_t cut = max_bytes;
-	while (cut > 0 && is_utf8_cont((unsigned char)s[cut])) {
-		cut--;
-	}
-	if (cut == 0) {
-		cut = max_bytes;
-	}
-
-	for (size_t i = cut; i > 0; i--) {
-		if (s[i] == ' ') {
-			return i;
-		}
-	}
-	return cut;
-}
-
-static void send_chunked_privmsg(AppState *st, NetConn *conn, const char *target, const char *text) {
-	if (!target || !text || text[0] == '\0') {
-		return;
-	}
-
-	size_t overhead = strlen("PRIVMSG  :\r\n") + strlen(target) + 120;
-	size_t max_payload = overhead < 480 ? (510 - overhead) : 256;
-
-	Buffer *b = state_get_or_create_buffer(st, target,
-	                                       (target[0] == '#' || target[0] == '&') ? BUF_CHANNEL : BUF_QUERY);
-
-	const char *p = text;
-	while (*p != '\0') {
-		size_t take = safe_utf8_split_len(p, max_payload);
-		char chunk[512];
-		snprintf(chunk, sizeof(chunk), "%.*s", (int)take, p);
-
-		irc_send_privmsg(conn, target, chunk);
-		buffer_push_line(b, LINE_MSG, st->nick, chunk, false);
-
-		p += take;
-		while (*p == ' ') {
-			p++;
-		}
-	}
-}
-
-static void split_first_arg(const char *input, char *arg1, size_t arg1_size, const char **rest) {
-	while (*input == ' ') {
-		input++;
+static void split_first_arg(const char *src, char *arg1, size_t max1, const char **rest) {
+	while (*src == ' ') {
+		src++;
 	}
 	size_t i = 0;
-	while (*input && *input != ' ' && i + 1 < arg1_size) {
-		arg1[i++] = *input++;
+	while (*src && *src != ' ' && i + 1 < max1) {
+		arg1[i++] = *src++;
 	}
 	arg1[i] = '\0';
-	while (*input == ' ') {
-		input++;
+	while (*src == ' ') {
+		src++;
 	}
-	*rest = input;
+	*rest = src;
 }
 
 bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char *input) {
@@ -92,11 +37,12 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 			buffer_push_line(active, LINE_ERROR, "", "Cannot send plain text to server buffer", false);
 			return true;
 		}
-		if (!conn->connected) {
+		if (!conn || !conn->connected) {
 			buffer_push_line(active, LINE_ERROR, "", "Not connected", false);
 			return true;
 		}
-		send_chunked_privmsg(st, conn, active->name, input);
+		irc_send_privmsg(conn, active->name, input);
+		buffer_push_line(active, LINE_MSG, st->nick, input, false);
 		return true;
 	}
 
@@ -104,18 +50,9 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 	const char *args = NULL;
 	split_first_arg(input + 1, cmd, sizeof(cmd), &args);
 
-	if (cmd[0] == '\0') {
-		return true;
-	}
-
-	if (lua_emit_command(lua, cmd, args)) {
-		return true;
-	}
-
-	if (strcasecmp(cmd, "quit") == 0) {
-		const char *reason = args[0] ? args : "lic";
-		if (conn->connected) {
-			irc_send_raw(conn, "QUIT :%s", reason);
+	if (strcasecmp(cmd, "quit") == 0 || strcasecmp(cmd, "q") == 0) {
+		if (conn && conn->connected) {
+			irc_send_raw(conn, "QUIT :%s", args[0] ? args : "lic");
 		}
 		return false;
 	}
@@ -133,76 +70,53 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 		} else {
 			irc_send_join(conn, chan);
 		}
-		Buffer *b = state_get_or_create_buffer(st, chan, BUF_CHANNEL);
-		for (size_t i = 0; i < st->buffer_count; i++) {
-			if (&st->buffers[i] == b) {
-				state_switch_buffer(st, i);
-				break;
-			}
-		}
+		state_get_or_create_buffer(st, chan, BUF_CHANNEL);
 		return true;
 	}
 
 	if (strcasecmp(cmd, "part") == 0 || strcasecmp(cmd, "leave") == 0) {
-		char chan[STATE_NAME_LEN];
-		const char *reason = NULL;
-		if (args[0] != '\0') {
-			split_first_arg(args, chan, sizeof(chan), &reason);
-		} else if (active && active->type == BUF_CHANNEL) {
-			snprintf(chan, sizeof(chan), "%s", active->name);
-			reason = "";
-		} else {
-			buffer_push_line(active, LINE_ERROR, "", "Usage: /part [#channel] [reason]", false);
-			return true;
+		const char *target = args[0] ? args : (active ? active->name : "");
+		if (target[0] == '#' || target[0] == '&') {
+			irc_send_raw(conn, "PART %s", target);
+			state_remove_buffer(st, target);
 		}
-		if (reason && reason[0] != '\0') {
-			irc_send_raw(conn, "PART %s :%s", chan, reason);
-		} else {
-			irc_send_raw(conn, "PART %s", chan);
-		}
-		state_remove_buffer(st, chan);
 		return true;
 	}
 
-	if (strcasecmp(cmd, "msg") == 0 || strcasecmp(cmd, "privmsg") == 0) {
-		char target[STATE_NAME_LEN];
-		const char *text = NULL;
-		split_first_arg(args, target, sizeof(target), &text);
-		if (target[0] == '\0' || text[0] == '\0') {
-			buffer_push_line(active, LINE_ERROR, "", "Usage: /msg <target> <message>", false);
-			return true;
+	if (strcasecmp(cmd, "close") == 0) {
+		if (active && active->type != BUF_SERVER) {
+			if (active->type == BUF_CHANNEL && conn && conn->connected) {
+				irc_send_raw(conn, "PART %s", active->name);
+			}
+			state_remove_buffer(st, active->name);
 		}
-		send_chunked_privmsg(st, conn, target, text);
 		return true;
 	}
 
-	if (strcasecmp(cmd, "query") == 0 || strcasecmp(cmd, "q") == 0) {
+	if (strcasecmp(cmd, "msg") == 0 || strcasecmp(cmd, "query") == 0) {
 		char target[STATE_NAME_LEN];
 		const char *text = NULL;
 		split_first_arg(args, target, sizeof(target), &text);
 		if (target[0] == '\0') {
-			buffer_push_line(active, LINE_ERROR, "", "Usage: /query <nick> [message]", false);
+			buffer_push_line(active, LINE_ERROR, "", "Usage: /msg <nick> [message]", false);
 			return true;
 		}
-		Buffer *b = state_get_or_create_buffer(st, target, BUF_QUERY);
-		for (size_t i = 0; i < st->buffer_count; i++) {
-			if (&st->buffers[i] == b) {
-				state_switch_buffer(st, i);
-				break;
-			}
-		}
+		BufferType btype = (target[0] == '#' || target[0] == '&') ? BUF_CHANNEL : BUF_QUERY;
+		Buffer *b = state_get_or_create_buffer(st, target, btype);
 		if (text[0] != '\0') {
-			send_chunked_privmsg(st, conn, target, text);
+			irc_send_privmsg(conn, target, text);
+			buffer_push_line(b, LINE_MSG, st->nick, text, false);
 		}
 		return true;
 	}
 
 	if (strcasecmp(cmd, "me") == 0) {
 		if (!active || active->type == BUF_SERVER || args[0] == '\0') {
-			buffer_push_line(active, LINE_ERROR, "", "Usage: /me <action>", false);
 			return true;
 		}
-		irc_send_raw(conn, "PRIVMSG %s :\001ACTION %s\001", active->name, args);
+		char ctcp[IRC_MAX_LINE];
+		snprintf(ctcp, sizeof(ctcp), "\001ACTION %s\001", args);
+		irc_send_privmsg(conn, active->name, ctcp);
 		buffer_push_line(active, LINE_ACTION, st->nick, args, false);
 		return true;
 	}
@@ -217,20 +131,20 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 	}
 
 	if (strcasecmp(cmd, "whois") == 0) {
-		const char *target = args[0] ? args : st->nick;
-		irc_send_raw(conn, "WHOIS %s", target);
+		if (args[0] != '\0') {
+			irc_send_raw(conn, "WHOIS %s", args);
+		}
 		return true;
 	}
 
 	if (strcasecmp(cmd, "topic") == 0) {
 		if (!active || active->type != BUF_CHANNEL) {
-			buffer_push_line(active, LINE_ERROR, "", "Not in a channel", false);
 			return true;
 		}
-		if (args[0] == '\0') {
-			irc_send_raw(conn, "TOPIC %s", active->name);
-		} else {
+		if (args[0] != '\0') {
 			irc_send_raw(conn, "TOPIC %s :%s", active->name, args);
+		} else {
+			irc_send_raw(conn, "TOPIC %s", active->name);
 		}
 		return true;
 	}
@@ -253,10 +167,16 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 
 	if (strcasecmp(cmd, "mode") == 0) {
 		if (args[0] == '\0') {
-			buffer_push_line(active, LINE_ERROR, "", "Usage: /mode <target> <modes>", false);
+			buffer_push_line(active, LINE_ERROR, "", "Usage: /mode [target] <modes>", false);
 			return true;
 		}
-		irc_send_raw(conn, "MODE %s", args);
+		if (args[0] == '+' || args[0] == '-') {
+			if (active && active->type == BUF_CHANNEL) {
+				irc_send_raw(conn, "MODE %s %s", active->name, args);
+			}
+		} else {
+			irc_send_raw(conn, "MODE %s", args);
+		}
 		return true;
 	}
 
@@ -269,25 +189,25 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 			return true;
 		}
 		irc_send_raw(conn, "NOTICE %s :%s", target, text);
-		char ev[STATE_TEXT_LEN];
-		snprintf(ev, sizeof(ev), "-> -%s- %s", target, text);
-		buffer_push_line(active, LINE_EVENT, "", ev, false);
+		char info[STATE_TEXT_LEN];
+		snprintf(info, sizeof(info), "-> -%s- %s", target, text);
+		buffer_push_line(active, LINE_EVENT, "", info, false);
 		return true;
 	}
 
 	if (strcasecmp(cmd, "names") == 0) {
 		if (!active || active->type != BUF_CHANNEL) {
-			buffer_push_line(active, LINE_ERROR, "", "Not in a channel", false);
 			return true;
 		}
 		char list[STATE_TEXT_LEN];
-		int pos = snprintf(list, sizeof(list), "Users (%zu): ", active->user_count);
-		for (size_t i = 0; i < active->user_count && pos < (int)sizeof(list) - 32; i++) {
+		size_t pos = 0;
+		pos += (size_t)snprintf(list + pos, sizeof(list) - pos, "Users (%zu): ", active->user_count);
+		for (size_t i = 0; i < active->user_count && pos < sizeof(list) - 32; i++) {
 			if (active->users[i].prefix) {
-				pos += snprintf(list + pos, sizeof(list) - (size_t)pos, "%c%s ",
-				                active->users[i].prefix, active->users[i].nick);
+				pos += (size_t)snprintf(list + pos, sizeof(list) - pos, "%c%s ",
+				                        active->users[i].prefix, active->users[i].nick);
 			} else {
-				pos += snprintf(list + pos, sizeof(list) - (size_t)pos, "%s ", active->users[i].nick);
+				pos += (size_t)snprintf(list + pos, sizeof(list) - pos, "%s ", active->users[i].nick);
 			}
 		}
 		buffer_push_line(active, LINE_EVENT, "", list, false);
@@ -302,24 +222,10 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 		return true;
 	}
 
-	if (strcasecmp(cmd, "close") == 0) {
-		if (!active || active->type == BUF_SERVER) {
-			buffer_push_line(active, LINE_ERROR, "", "Cannot close server buffer", false);
-			return true;
-		}
-		if (active->type == BUF_CHANNEL && conn->connected) {
-			irc_send_raw(conn, "PART %s", active->name);
-		}
-		state_remove_buffer(st, active->name);
-		return true;
-	}
-
 	if (strcasecmp(cmd, "raw") == 0 || strcasecmp(cmd, "quote") == 0) {
-		if (args[0] == '\0') {
-			buffer_push_line(active, LINE_ERROR, "", "Usage: /raw <IRC command>", false);
-			return true;
+		if (args[0] != '\0') {
+			irc_send_raw(conn, "%s", args);
 		}
-		irc_send_raw(conn, "%s", args);
 		return true;
 	}
 
@@ -331,11 +237,13 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 	}
 
 	if (strcasecmp(cmd, "lua") == 0) {
-		if (args[0] == '\0') {
-			buffer_push_line(active, LINE_ERROR, "", "Usage: /lua <code>", false);
-			return true;
+		if (args[0] != '\0') {
+			lua_exec_string(lua, args);
 		}
-		lua_exec_string(lua, args);
+		return true;
+	}
+
+	if (lua_emit_command(lua, cmd, args)) {
 		return true;
 	}
 
@@ -343,4 +251,209 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 	snprintf(err, sizeof(err), "Unknown command: /%s", cmd);
 	buffer_push_line(active, LINE_ERROR, "", err, false);
 	return true;
+}
+
+static void format_lua_string_assign(char *dst, size_t dst_size, const char *lhs, const char *val) {
+	size_t pos = 0;
+	int w = snprintf(dst, dst_size, "%s = \"", lhs);
+	if (w > 0) {
+		pos = (size_t)w < dst_size ? (size_t)w : dst_size - 1;
+	}
+
+	for (const char *p = val; *p && pos + 3 < dst_size; p++) {
+		if (*p == '"' || *p == '\\') {
+			dst[pos++] = '\\';
+		}
+		dst[pos++] = *p;
+	}
+
+	if (pos + 2 < dst_size) {
+		dst[pos++] = '"';
+	}
+	dst[pos] = '\0';
+}
+
+static void apply_vim_set(AppState *st, UiState *ui, struct LuaEngine *lua, const char *expr) {
+	Buffer *active = state_active_buffer(st);
+	if (!expr || expr[0] == '\0') {
+		buffer_push_line(active, LINE_ERROR, "", "Usage: :set <option>=<value>", false);
+		return;
+	}
+
+	char key[64];
+	const char *eq = strchr(expr, '=');
+	if (!eq) {
+		if (strcmp(expr, "split") == 0) {
+			ui->split_enabled = true;
+			return;
+		}
+		if (strcmp(expr, "nosplit") == 0) {
+			ui->split_enabled = false;
+			return;
+		}
+		buffer_push_line(active, LINE_ERROR, "", "Usage: :set <option>=<value>", false);
+		return;
+	}
+
+	size_t klen = (size_t)(eq - expr);
+	if (klen == 0 || klen >= sizeof(key)) {
+		return;
+	}
+	memcpy(key, expr, klen);
+	key[klen] = '\0';
+	const char *val = eq + 1;
+
+	if (strcmp(key, "split") == 0) {
+		ui->split_enabled = (strcmp(val, "1") == 0 || strcasecmp(val, "true") == 0 || strcasecmp(val, "on") == 0);
+		return;
+	}
+
+	char lua_snippet[512];
+	char lhs[128];
+
+	if (strcmp(key, "bar_bg") == 0 || strcmp(key, "bar_fg") == 0 ||
+	    strcmp(key, "active_bg") == 0 || strcmp(key, "active_fg") == 0 ||
+	    strcmp(key, "unread") == 0 || strcmp(key, "mention") == 0 ||
+	    strcmp(key, "timestamp") == 0 || strcmp(key, "event") == 0 ||
+	    strcmp(key, "error") == 0 || strcmp(key, "action") == 0 ||
+	    strcmp(key, "prompt") == 0) {
+		snprintf(lhs, sizeof(lhs), "lic.theme.%s", key);
+		char *endp = NULL;
+		long num = strtol(val, &endp, 10);
+		if (endp && *endp == '\0') {
+			snprintf(lua_snippet, sizeof(lua_snippet), "%s = %ld", lhs, num);
+		} else {
+			format_lua_string_assign(lua_snippet, sizeof(lua_snippet), lhs, val);
+		}
+		lua_exec_string(lua, lua_snippet);
+		return;
+	}
+
+	snprintf(lhs, sizeof(lhs), "lic.config.%s", key);
+	if (strcmp(key, "tls") == 0) {
+		bool b = (strcmp(val, "1") == 0 || strcasecmp(val, "true") == 0 || strcasecmp(val, "on") == 0);
+		snprintf(lua_snippet, sizeof(lua_snippet), "%s = %s", lhs, b ? "true" : "false");
+	} else if (strcmp(key, "port") == 0 || strcmp(key, "history_size") == 0) {
+		snprintf(lua_snippet, sizeof(lua_snippet), "%s = %d", lhs, atoi(val));
+	} else {
+		format_lua_string_assign(lua_snippet, sizeof(lua_snippet), lhs, val);
+	}
+	lua_exec_string(lua, lua_snippet);
+}
+
+bool cmd_execute_vim(AppState *st, NetConn *conn, UiState *ui, struct LuaEngine *lua, const char *ex_cmd) {
+	if (!ex_cmd) {
+		return true;
+	}
+	while (*ex_cmd == ' ' || *ex_cmd == ':') {
+		ex_cmd++;
+	}
+	if (ex_cmd[0] == '\0') {
+		return true;
+	}
+
+	char verb[32];
+	const char *args = NULL;
+	split_first_arg(ex_cmd, verb, sizeof(verb), &args);
+	Buffer *active = state_active_buffer(st);
+
+	if (strcmp(verb, "q") == 0 || strcmp(verb, "q!") == 0 ||
+	    strcmp(verb, "qa") == 0 || strcmp(verb, "qa!") == 0 ||
+	    strcmp(verb, "quit") == 0 || strcmp(verb, "wq") == 0) {
+		if (conn && conn->connected) {
+			irc_send_raw(conn, "QUIT :lic");
+		}
+		return false;
+	}
+
+	if (strcmp(verb, "bd") == 0 || strcmp(verb, "bd!") == 0 || strcmp(verb, "bw") == 0) {
+		if (!active || active->type == BUF_SERVER) {
+			buffer_push_line(active, LINE_ERROR, "", "Cannot close server buffer", false);
+			return true;
+		}
+		if (active->type == BUF_CHANNEL && conn && conn->connected) {
+			irc_send_raw(conn, "PART %s", active->name);
+		}
+		state_remove_buffer(st, active->name);
+		return true;
+	}
+
+	if (strcmp(verb, "bn") == 0 || strcmp(verb, "bnext") == 0) {
+		state_next_buffer(st);
+		return true;
+	}
+
+	if (strcmp(verb, "bp") == 0 || strcmp(verb, "bprev") == 0 || strcmp(verb, "bN") == 0) {
+		state_prev_buffer(st);
+		return true;
+	}
+
+	if (strcmp(verb, "b") == 0 || strcmp(verb, "buffer") == 0) {
+		if (args[0] == '\0') {
+			return true;
+		}
+		char *endp = NULL;
+		long idx = strtol(args, &endp, 10);
+		if (endp && *endp == '\0' && idx >= 1) {
+			state_switch_buffer(st, (size_t)(idx - 1));
+			return true;
+		}
+		for (size_t i = 0; i < st->buffer_count; i++) {
+			if (strcasecmp(st->buffers[i].name, args) == 0) {
+				state_switch_buffer(st, i);
+				return true;
+			}
+		}
+		buffer_push_line(active, LINE_ERROR, "", "Buffer not found", false);
+		return true;
+	}
+
+	if (strcmp(verb, "vs") == 0 || strcmp(verb, "vsplit") == 0 ||
+	    strcmp(verb, "sp") == 0 || strcmp(verb, "split") == 0) {
+		ui->split_enabled = !ui->split_enabled;
+		return true;
+	}
+
+	if (strcmp(verb, "on") == 0 || strcmp(verb, "only") == 0) {
+		ui->split_enabled = false;
+		return true;
+	}
+
+	if (strcmp(verb, "e") == 0 || strcmp(verb, "e!") == 0 || strcmp(verb, "reload") == 0) {
+		if (lua_reload(lua)) {
+			buffer_push_line(active, LINE_EVENT, "", "Lua configuration reloaded", false);
+		}
+		return true;
+	}
+
+	if (strcmp(verb, "so") == 0 || strcmp(verb, "source") == 0) {
+		if (args[0] == '\0') {
+			buffer_push_line(active, LINE_ERROR, "", "Usage: :source <file.lua>", false);
+			return true;
+		}
+		if (lua_exec_file(lua, args)) {
+			char msg[256];
+			snprintf(msg, sizeof(msg), "Sourced %s", args);
+			buffer_push_line(active, LINE_EVENT, "", msg, false);
+		}
+		return true;
+	}
+
+	if (strcmp(verb, "lua") == 0) {
+		if (args[0] == '\0') {
+			buffer_push_line(active, LINE_ERROR, "", "Usage: :lua <code>", false);
+			return true;
+		}
+		lua_exec_string(lua, args);
+		return true;
+	}
+
+	if (strcmp(verb, "set") == 0) {
+		apply_vim_set(st, ui, lua, args);
+		return true;
+	}
+
+	char slash_fallback[UI_INPUT_MAX];
+	snprintf(slash_fallback, sizeof(slash_fallback), "/%s", ex_cmd);
+	return cmd_execute(st, conn, lua, slash_fallback);
 }

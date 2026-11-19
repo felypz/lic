@@ -14,6 +14,7 @@
 typedef enum {
 	UI_ACTION_NONE,
 	UI_ACTION_SUBMIT,
+	UI_ACTION_VIM_CMD,
 	UI_ACTION_NEXT_BUF,
 	UI_ACTION_PREV_BUF,
 	UI_ACTION_SWITCH_BUF,
@@ -21,6 +22,7 @@ typedef enum {
 } UiAction;
 
 typedef enum {
+	UI_MODE_COMMAND,
 	UI_MODE_INSERT,
 	UI_MODE_NORMAL
 } UiMode;

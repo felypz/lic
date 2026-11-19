@@ -97,6 +97,28 @@ static void rejoin_open_channels(AppState *st, NetConn *conn, const struct LuaEn
 	}
 }
 
+static bool process_ui_action(UiAction act, AppState *state, NetConn *conn, UiState *ui,
+                              struct LuaEngine *lua, const char *input_line) {
+	if (act == UI_ACTION_QUIT) {
+		if (conn && conn->connected) {
+			irc_send_raw(conn, "QUIT :lic");
+		}
+		return false;
+	}
+	if (act == UI_ACTION_NEXT_BUF) {
+		state_next_buffer(state);
+	} else if (act == UI_ACTION_PREV_BUF) {
+		state_prev_buffer(state);
+	} else if (act == UI_ACTION_SWITCH_BUF) {
+		state_switch_buffer(state, ui->target_buf_idx);
+	} else if (act == UI_ACTION_SUBMIT) {
+		return cmd_execute(state, conn, lua, input_line);
+	} else if (act == UI_ACTION_VIM_CMD) {
+		return cmd_execute_vim(state, conn, ui, lua, input_line);
+	}
+	return true;
+}
+
 static void dispatch_irc_message(AppState *st, NetConn *conn, struct LuaEngine *lua, IrcMessage *msg, int *backoff_sec) {
 	if (strcmp(msg->command, "PING") == 0 && msg->param_count > 0) {
 		irc_send_raw(conn, "PONG :%s", msg->params[0]);
@@ -342,17 +364,7 @@ int main(void) {
 				struct pollfd spfd = {.fd = STDIN_FILENO, .events = POLLIN};
 				if (poll(&spfd, 1, 100) > 0 && (spfd.revents & POLLIN)) {
 					UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
-					if (act == UI_ACTION_QUIT) {
-						running = false;
-					} else if (act == UI_ACTION_NEXT_BUF) {
-						state_next_buffer(state);
-					} else if (act == UI_ACTION_PREV_BUF) {
-						state_prev_buffer(state);
-					} else if (act == UI_ACTION_SWITCH_BUF) {
-						state_switch_buffer(state, ui.target_buf_idx);
-					} else if (act == UI_ACTION_SUBMIT && !cmd_execute(state, &conn, &lua, input_line)) {
-						running = false;
-					}
+					running = process_ui_action(act, state, &conn, &ui, &lua, input_line);
 				}
 				lua_tick_timers(&lua, &ui.dirty);
 				if (ui.dirty) {
@@ -412,18 +424,7 @@ int main(void) {
 
 			if (pfds[0].revents & POLLIN) {
 				UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
-				if (act == UI_ACTION_QUIT) {
-					irc_send_raw(&conn, "QUIT :lic");
-					running = false;
-				} else if (act == UI_ACTION_NEXT_BUF) {
-					state_next_buffer(state);
-				} else if (act == UI_ACTION_PREV_BUF) {
-					state_prev_buffer(state);
-				} else if (act == UI_ACTION_SWITCH_BUF) {
-					state_switch_buffer(state, ui.target_buf_idx);
-				} else if (act == UI_ACTION_SUBMIT && !cmd_execute(state, &conn, &lua, input_line)) {
-					running = false;
-				}
+				running = process_ui_action(act, state, &conn, &ui, &lua, input_line);
 			}
 
 			if (ping_sent_at == 0 && (now - last_rx) >= PING_IDLE_SEC) {
@@ -454,17 +455,7 @@ int main(void) {
 				struct pollfd spfd = {.fd = STDIN_FILENO, .events = POLLIN};
 				if (poll(&spfd, 1, 100) > 0 && (spfd.revents & POLLIN)) {
 					UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
-					if (act == UI_ACTION_QUIT) {
-						running = false;
-					} else if (act == UI_ACTION_NEXT_BUF) {
-						state_next_buffer(state);
-					} else if (act == UI_ACTION_PREV_BUF) {
-						state_prev_buffer(state);
-					} else if (act == UI_ACTION_SWITCH_BUF) {
-						state_switch_buffer(state, ui.target_buf_idx);
-					} else if (act == UI_ACTION_SUBMIT && !cmd_execute(state, &conn, &lua, input_line)) {
-						running = false;
-					}
+					running = process_ui_action(act, state, &conn, &ui, &lua, input_line);
 				}
 				lua_tick_timers(&lua, &ui.dirty);
 				if (ui.dirty) {
