@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lua_api.h"
 
-#include <ctype.h>
 #include <dirent.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -156,7 +155,7 @@ static void read_theme_field(lua_State *L, const char *field, LicColor *dst) {
 
 static void config_set_defaults(LicConfig *cfg) {
 	memset(cfg, 0, sizeof(*cfg));
-	snprintf(cfg->host, sizeof(cfg->host), "irc.libera.chat");
+	cfg->host[0] = '\0';
 	snprintf(cfg->port, sizeof(cfg->port), "6697");
 	cfg->tls = true;
 	snprintf(cfg->user, sizeof(cfg->user), "lic");
@@ -183,7 +182,9 @@ static int l_send(lua_State *L) {
 		irc_send_privmsg(g_eng->conn, target, text);
 		BufferType btype = (target[0] == '#' || target[0] == '&') ? BUF_CHANNEL : BUF_QUERY;
 		Buffer *b = state_get_or_create_buffer(g_eng->state, target, btype);
-		buffer_push_line(b, LINE_MSG, g_eng->state->nick, text, false);
+		if (b) {
+			buffer_push_line(b, LINE_MSG, g_eng->state->nick, text, false);
+		}
 	}
 	return 0;
 }
@@ -537,7 +538,7 @@ static void load_plugins_from_dir(struct LuaEngine *eng) {
 	qsort(files, count, sizeof(char *), cmp_str_ptr);
 
 	for (size_t i = 0; i < count; i++) {
-		char fullpath[512];
+		char fullpath[1024];
 		snprintf(fullpath, sizeof(fullpath), "%s/%s", eng->plugin_dir, files[i]);
 		if (luaL_dofile(eng->L, fullpath) != LUA_OK) {
 			Buffer *b = state_active_buffer(eng->state);
@@ -606,7 +607,8 @@ bool lua_reload(struct LuaEngine *eng) {
 	return true;
 }
 
-bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path, const char *plugin_dir) {
+bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn,
+                     const char *script_path, const char *plugin_dir) {
 	(void)script_path;
 	(void)plugin_dir;
 

@@ -320,12 +320,13 @@ int main(void) {
 	struct LuaEngine lua;
 	UiState ui;
 
-	state_init(state, "irc.libera.chat", "", 1024);
-	lua_engine_init(&lua, state, &conn, "config/init.lua", "config/plugins");
-	state_init(state, lua.config.host, lua.config.nick, lua.config.history_size);
+	lua_engine_init(&lua, state, &conn, NULL, NULL);
+	const char *init_srv_name = lua.config.host[0] != '\0' ? lua.config.host : "server";
+	state_init(state, init_srv_name, lua.config.nick, lua.config.history_size);
 
 	if (!ui_init(&ui)) {
 		fprintf(stderr, "lic: failed to initialize terminal UI\n");
+		lua_engine_close(&lua);
 		state_free(state);
 		free(state);
 		return 1;
@@ -342,13 +343,34 @@ int main(void) {
 	}
 
 	Buffer *srv = &state->buffers[0];
+	if (lua.config.host[0] == '\0') {
+		buffer_push_line(srv, LINE_EVENT, "",
+		                 "No server configured. Use /connect <host> [port] or :connect <host> [port]",
+		                 false);
+	}
+
 	char raw_buf[4096];
 	char line[IRC_MAX_LINE];
 	char input_line[UI_INPUT_MAX];
 	int backoff_sec = BACKOFF_MIN_SEC;
 	bool running = true;
 
+	ui_render(&ui, state, &lua.config.theme);
+
 	while (running) {
+		if (lua.config.host[0] == '\0' && !conn.connected) {
+			struct pollfd ipfd = {.fd = STDIN_FILENO, .events = POLLIN};
+			if (poll(&ipfd, 1, 100) > 0 && (ipfd.revents & POLLIN)) {
+				UiAction act = ui_handle_stdin(&ui, state, &lua, input_line, sizeof(input_line));
+				running = process_ui_action(act, state, &conn, &ui, &lua, input_line);
+			}
+			lua_tick_timers(&lua, &ui.dirty);
+			if (ui.dirty) {
+				ui_render(&ui, state, &lua.config.theme);
+			}
+			continue;
+		}
+
 		char msg_buf[256];
 		snprintf(msg_buf, sizeof(msg_buf), "Connecting to %s:%s...", lua.config.host, lua.config.port);
 		buffer_push_line(srv, LINE_EVENT, "", msg_buf, false);
@@ -445,7 +467,7 @@ int main(void) {
 
 		net_close(&conn);
 
-		if (running) {
+		if (running && lua.config.host[0] != '\0') {
 			snprintf(msg_buf, sizeof(msg_buf), "Reconnecting in %ds...", backoff_sec);
 			buffer_push_line(srv, LINE_EVENT, "", msg_buf, false);
 			ui.dirty = true;

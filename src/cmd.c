@@ -50,6 +50,40 @@ bool cmd_execute(AppState *st, NetConn *conn, struct LuaEngine *lua, const char 
 	const char *args = NULL;
 	split_first_arg(input + 1, cmd, sizeof(cmd), &args);
 
+	if (strcasecmp(cmd, "connect") == 0) {
+		if (!args || args[0] == '\0') {
+			buffer_push_line(active, LINE_ERROR, "", "Usage: /connect <host> [port]", false);
+			return true;
+		}
+		char host[STATE_NAME_LEN];
+		const char *port_rest = NULL;
+		split_first_arg(args, host, sizeof(host), &port_rest);
+
+		char port[16];
+		const char *unused = NULL;
+		if (port_rest && port_rest[0] != '\0') {
+			split_first_arg(port_rest, port, sizeof(port), &unused);
+		} else {
+			snprintf(port, sizeof(port), "%s",
+			         (lua && lua->config.port[0] != '\0') ? lua->config.port : "6697");
+		}
+
+		if (lua) {
+			snprintf(lua->config.host, sizeof(lua->config.host), "%s", host);
+			snprintf(lua->config.port, sizeof(lua->config.port), "%s", port);
+		}
+		if (st) {
+			snprintf(st->server_name, sizeof(st->server_name), "%s", host);
+			if (st->buffer_count > 0 && st->buffers[0].name[0] == '\0') {
+				snprintf(st->buffers[0].name, sizeof(st->buffers[0].name), "%s", host);
+			}
+		}
+		if (conn) {
+			net_close(conn);
+		}
+		return true;
+	}
+
 	if (strcasecmp(cmd, "quit") == 0 || strcasecmp(cmd, "q") == 0) {
 		if (conn && conn->connected) {
 			irc_send_raw(conn, "QUIT :%s", args[0] ? args : "lic");

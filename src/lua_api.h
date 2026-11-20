@@ -4,7 +4,6 @@
 #include "irc.h"
 #include "net.h"
 #include "state.h"
-#include <lua.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -38,13 +37,13 @@ typedef struct {
 } LicTheme;
 
 typedef struct {
-	char host[128];
+	char host[STATE_NAME_LEN];
 	char port[16];
 	bool tls;
 	char nick[STATE_NICK_LEN];
-	char user[64];
-	char realname[128];
-	char sasl_user[64];
+	char user[STATE_NICK_LEN];
+	char realname[STATE_NICK_LEN];
+	char sasl_user[STATE_NICK_LEN];
 	char sasl_pass[128];
 	size_t history_size;
 	char auto_join[16][STATE_NAME_LEN];
@@ -52,21 +51,26 @@ typedef struct {
 	LicTheme theme;
 } LicConfig;
 
+struct lua_State;
+
 struct LuaEngine {
-	lua_State *L;
+	struct lua_State *L;
 	AppState *state;
 	NetConn *conn;
-	char script_path[256];
-	char plugin_dir[256];
+	char script_path[512];
+	char plugin_dir[512];
 	LicConfig config;
 };
 
-bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn, const char *script_path, const char *plugin_dir);
+bool lua_engine_init(struct LuaEngine *eng, AppState *st, NetConn *conn,
+                     const char *script_path, const char *plugin_dir);
 void lua_engine_close(struct LuaEngine *eng);
 bool lua_reload(struct LuaEngine *eng);
 void lua_sync_runtime(struct LuaEngine *eng);
+
 void lua_exec_string(struct LuaEngine *eng, const char *code);
 bool lua_exec_file(struct LuaEngine *eng, const char *path);
+
 bool lua_emit_message(struct LuaEngine *eng, const IrcMessage *msg);
 bool lua_emit_input(struct LuaEngine *eng, const char *input);
 bool lua_emit_command(struct LuaEngine *eng, const char *cmd, const char *arg);
